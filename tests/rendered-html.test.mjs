@@ -28,10 +28,19 @@ test("server-renders the WCL analyzer shell", async () => {
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
 
   const html = await response.text();
-  assert.match(html, /<title>战痕｜魔兽世界时光服 WCL 日志分析<\/title>/i);
+  assert.match(html, /<title>时光战痕｜魔兽世界时光服 WCL 日志分析<\/title>/i);
   assert.match(html, /时光服 WCL 分析台/);
   assert.match(html, /原始日志不上传/);
-  assert.match(html, /伤害排行/);
-  assert.match(html, /关键增益/);
+  assert.match(html, /导入真实日志后显示分析报告/);
+  assert.match(html, /演示数据已默认收起/);
+  assert.match(html, /查看界面演示/);
+  assert.match(html, /非真实数据/);
+  assert.doesNotMatch(html, /class="report-section"/);
+  assert.doesNotMatch(html, /战斗复盘时间轴|逐事件明细|玩家操作轴/);
+  assert.match(html, /时光服阶段副本表/);
+  assert.match(html, /纳克萨玛斯属于 <strong>P3<\/strong>/);
+  assert.match(html, /能处理真实日志，但不冒充完整 WCL/);
+  assert.match(html, /href="https:\/\/github\.com\/liven666\/time-scar-wcl-analyzer"/);
+  assert.match(html, /GitHub 源码/);
   assert.doesNotMatch(html, /codex-preview|react-loading-skeleton/i);
 });

@@ -2,13 +2,19 @@
 
 import {
   createDemoReport,
-  parseCombatLogFile,
   type AuraMetric,
   type CombatReport,
   type CombatRole,
+  type ParseOptions,
   type PlayerMeta,
   type WowClass,
 } from "./lib/combat-log";
+import {
+  createCombatLogWorker,
+  parseCombatLogFileInWorker,
+  type CombatLogWorkerResponse,
+} from "./lib/combat-log-client";
+import CombatReplay from "./CombatReplay";
 import {
   type CSSProperties,
   type ChangeEvent,
@@ -21,6 +27,102 @@ import {
 
 type ReportKind = "demo" | "local" | "shared";
 type DamageView = "boss" | "full" | "trash";
+type ThemeMode = "dark" | "light";
+type LiveLogStatus = "idle" | "starting" | "watching";
+
+interface LocalFileHandle {
+  name: string;
+  getFile: () => Promise<File>;
+}
+
+interface FilePickerWindow extends Window {
+  showOpenFilePicker?: (options?: {
+    multiple?: boolean;
+    types?: Array<{
+      description?: string;
+      accept: Record<string, string[]>;
+    }>;
+  }) => Promise<LocalFileHandle[]>;
+}
+
+interface LiveLogSource {
+  name: string;
+  getInitialFile: () => Promise<File>;
+  readGrowth: (offset: number) => Promise<{
+    size: number;
+    chunk?: ArrayBuffer;
+    rotated: boolean;
+  }>;
+}
+
+const LIVE_HELPER_ROOT = "http://127.0.0.1:3001";
+
+async function localHelperError(response: Response): Promise<Error> {
+  try {
+    const payload = (await response.json()) as { error?: unknown };
+    if (typeof payload.error === "string") return new Error(payload.error);
+  } catch {
+    // Fall through to the HTTP status when the helper returned plain text.
+  }
+  return new Error(`本地实时助手返回 ${response.status}`);
+}
+
+function fileHandleLiveSource(handle: LocalFileHandle): LiveLogSource {
+  return {
+    name: handle.name,
+    getInitialFile: () => handle.getFile(),
+    readGrowth: async (offset) => {
+      const file = await handle.getFile();
+      if (file.size < offset) {
+        return { size: file.size, rotated: true };
+      }
+      return {
+        size: file.size,
+        rotated: false,
+        chunk:
+          file.size > offset
+            ? await file.slice(offset).arrayBuffer()
+            : undefined,
+      };
+    },
+  };
+}
+
+function localPathLiveSource(path: string): LiveLogSource {
+  const normalizedPath = path.trim();
+  const query = encodeURIComponent(normalizedPath);
+  return {
+    name: normalizedPath.split(/[\\/]/).at(-1) || "WoWCombatLog.txt",
+    getInitialFile: async () => {
+      const response = await fetch(`${LIVE_HELPER_ROOT}/file?path=${query}`, {
+        cache: "no-store",
+      });
+      if (!response.ok) throw await localHelperError(response);
+      const encodedName = response.headers.get("X-File-Name");
+      const name = encodedName
+        ? decodeURIComponent(encodedName)
+        : normalizedPath.split(/[\\/]/).at(-1) || "WoWCombatLog.txt";
+      return new File([await response.blob()], name, { type: "text/plain" });
+    },
+    readGrowth: async (offset) => {
+      const response = await fetch(
+        `${LIVE_HELPER_ROOT}/range?path=${query}&offset=${offset}`,
+        { cache: "no-store" },
+      );
+      if (!response.ok && response.status !== 204) {
+        throw await localHelperError(response);
+      }
+      const size = Number(response.headers.get("X-File-Size")) || 0;
+      const rotated = response.headers.get("X-Log-Rotated") === "1";
+      return {
+        size,
+        rotated,
+        chunk:
+          response.status === 204 ? undefined : await response.arrayBuffer(),
+      };
+    },
+  };
+}
 
 interface RankedPlayer extends PlayerMeta {
   bossDamage: number;
@@ -62,6 +164,7 @@ const CLASS_SHORT: Record<WowClass, string> = {
 
 const ROLE_LABELS: Record<CombatRole, string> = {
   tank: "坦克",
+  healer: "治疗",
   melee: "近战",
   ranged: "远程",
   unknown: "待识别",
@@ -87,22 +190,54 @@ const AURA_LABELS: Record<
     name: "恶魔契约",
     icon: "契",
     target: 92,
-    note: "统计团队获得 Buff 的时长",
+    note: "统计团队内 Buff 存在时长",
   },
 };
 
+const TITAN_PHASES = [
+  { phase: "P1", raids: "熔火之心", status: "official" },
+  { phase: "P2", raids: "风暴要塞 · 毒蛇神殿", status: "official" },
+  {
+    phase: "P3",
+    raids: "纳克萨玛斯 · 黑曜石圣殿 · 永恒之眼",
+    status: "official",
+  },
+  { phase: "P4", raids: "十字军的试炼 · 祖尔格拉布", status: "official" },
+  { phase: "P5", raids: "太阳之井高地 · 祖阿曼", status: "preview" },
+  { phase: "P6", raids: "奥杜尔", status: "preview" },
+  {
+    phase: "P7",
+    raids: "卡拉赞 · 格鲁尔的巢穴 · 玛瑟里顿的巢穴",
+    status: "preview",
+  },
+  {
+    phase: "P8",
+    raids: "黑翼之巢 · 奥妮克希亚的巢穴 · 安其拉废墟",
+    status: "preview",
+  },
+  { phase: "P9", raids: "安其拉神殿", status: "preview" },
+  { phase: "P10", raids: "冰冠堡垒 · 红玉圣殿", status: "preview" },
+  { phase: "P11", raids: "黑暗神殿 · 海加尔山之战", status: "preview" },
+] as const;
+
 const numberFormatter = new Intl.NumberFormat("zh-CN");
-const compactFormatter = new Intl.NumberFormat("zh-CN", {
-  notation: "compact",
-  maximumFractionDigits: 1,
-});
 
 function formatNumber(value: number): string {
   return numberFormatter.format(Math.round(value));
 }
 
 function formatCompact(value: number): string {
-  return compactFormatter.format(Math.max(0, value));
+  const normalized = Math.max(0, value);
+  const formatUnit = (divisor: number, unit: string) => {
+    const scaled = normalized / divisor;
+    const maximumFractionDigits = scaled >= 100 ? 0 : scaled >= 10 ? 1 : 2;
+    return `${new Intl.NumberFormat("zh-CN", {
+      maximumFractionDigits,
+    }).format(scaled)} ${unit}`;
+  };
+  if (normalized >= 100_000_000) return formatUnit(100_000_000, "亿");
+  if (normalized >= 10_000) return formatUnit(10_000, "万");
+  return formatNumber(normalized);
 }
 
 function formatBytes(bytes: number): string {
@@ -136,8 +271,26 @@ function formatGeneratedAt(value: string): string {
   }).format(new Date(value));
 }
 
+function mergeLiveReport(
+  current: CombatReport,
+  update: CombatReport,
+  fightCount: number,
+): CombatReport {
+  const fights = [...current.fights];
+  for (const nextFight of update.fights) {
+    const index = fights.findIndex((fight) => fight.id === nextFight.id);
+    if (index >= 0) fights[index] = nextFight;
+    else fights.push(nextFight);
+  }
+  return {
+    ...update,
+    fights: fights.slice(0, fightCount),
+  };
+}
+
 function roleStyle(role: CombatRole): string {
   if (role === "tank") return "role-tank";
+  if (role === "healer") return "role-healer";
   if (role === "ranged") return "role-ranged";
   if (role === "melee") return "role-melee";
   return "role-unknown";
@@ -164,7 +317,16 @@ function base64ToBytes(value: string): Uint8Array {
 }
 
 async function encodeReport(report: CombatReport): Promise<string> {
-  const json = JSON.stringify(report);
+  const shareableReport: CombatReport = {
+    ...report,
+    spellNames: undefined,
+    unitNames: undefined,
+    fights: report.fights.map((fight) => ({
+      ...fight,
+      timeline: undefined,
+    })),
+  };
+  const json = JSON.stringify(shareableReport);
   if (typeof CompressionStream === "undefined") {
     return `raw.${bytesToBase64(new TextEncoder().encode(json))}`;
   }
@@ -216,8 +378,16 @@ async function copyText(value: string): Promise<void> {
 
 export default function WclAnalyzer() {
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const liveWorkerRef = useRef<Worker | null>(null);
+  const liveSourceRef = useRef<LiveLogSource | null>(null);
+  const liveOffsetRef = useRef(0);
+  const liveRequestIdRef = useRef(0);
+  const livePollTimerRef = useRef<number | null>(null);
+  const livePollBusyRef = useRef(false);
+  const liveAppendPendingRef = useRef(false);
   const [report, setReport] = useState<CombatReport>(() => createDemoReport());
   const [reportKind, setReportKind] = useState<ReportKind>("demo");
+  const [demoReportVisible, setDemoReportVisible] = useState(false);
   const [activeFightIds, setActiveFightIds] = useState<Set<string>>(
     () => new Set(createDemoReport().fights.map((fight) => fight.id)),
   );
@@ -226,7 +396,7 @@ export default function WclAnalyzer() {
   const [view, setView] = useState<DamageView>("boss");
   const [thresholdRank, setThresholdRank] = useState(2);
   const [thresholdPercent, setThresholdPercent] = useState(60);
-  const [excludeBoosted, setExcludeBoosted] = useState(true);
+  const [excludeBoosted, setExcludeBoosted] = useState(false);
   const [showAll, setShowAll] = useState(false);
   const [selectedPlayerId, setSelectedPlayerId] = useState("p-mage");
   const [startTime, setStartTime] = useState("");
@@ -239,10 +409,19 @@ export default function WclAnalyzer() {
   const [error, setError] = useState("");
   const [toast, setToast] = useState("");
   const [ruleTargetsOpen, setRuleTargetsOpen] = useState(false);
+  const [theme, setTheme] = useState<ThemeMode>("dark");
+  const [liveSupported, setLiveSupported] = useState(false);
+  const [liveHelperAvailable, setLiveHelperAvailable] = useState(false);
+  const [localPreview, setLocalPreview] = useState(false);
+  const [livePath, setLivePath] = useState("");
+  const [liveStatus, setLiveStatus] = useState<LiveLogStatus>("idle");
+  const [liveLastUpdate, setLiveLastUpdate] = useState<Date | null>(null);
+  const [liveFileName, setLiveFileName] = useState("");
 
   const activateReport = (nextReport: CombatReport, kind: ReportKind) => {
     setReport(nextReport);
     setReportKind(kind);
+    if (kind !== "demo") setDemoReportVisible(false);
     setActiveFightIds(
       new Set(
         nextReport.fights
@@ -259,6 +438,53 @@ export default function WclAnalyzer() {
     setShowAll(false);
     setError("");
   };
+
+  useEffect(() => {
+    let cancelled = false;
+    const saved = window.localStorage.getItem("time-scar-theme");
+    const resolved: ThemeMode =
+      saved === "dark" || saved === "light"
+        ? saved
+        : window.matchMedia("(prefers-color-scheme: light)").matches
+          ? "light"
+          : "dark";
+    document.documentElement.dataset.theme = resolved;
+    document.documentElement.style.colorScheme = resolved;
+    const timer = window.setTimeout(() => {
+      if (cancelled) return;
+      const isLocalPreview =
+        window.location.hostname === "localhost" ||
+        window.location.hostname === "127.0.0.1";
+      setTheme(resolved);
+      setLiveSupported(
+        typeof (window as FilePickerWindow).showOpenFilePicker === "function",
+      );
+      setLocalPreview(isLocalPreview);
+      if (isLocalPreview) {
+        void fetch(`${LIVE_HELPER_ROOT}/health`, { cache: "no-store" })
+          .then((response) => {
+            if (!cancelled) setLiveHelperAvailable(response.ok);
+          })
+          .catch(() => {
+            if (!cancelled) setLiveHelperAvailable(false);
+          });
+      }
+    }, 0);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, []);
+
+  useEffect(
+    () => () => {
+      if (livePollTimerRef.current !== null) {
+        window.clearTimeout(livePollTimerRef.current);
+      }
+      liveWorkerRef.current?.terminate();
+    },
+    [],
+  );
 
   useEffect(() => {
     const payload = new URLSearchParams(window.location.hash.slice(1)).get("report");
@@ -341,7 +567,9 @@ export default function WclAnalyzer() {
 
     raw.sort((a, b) => b.totalDamage - a.totalDamage);
     const totalRaidDamage = raw.reduce((sum, player) => sum + player.totalDamage, 0);
-    const damageDealers = raw.filter((player) => player.role !== "tank");
+    const damageDealers = raw.filter(
+      (player) => player.role !== "tank" && player.role !== "healer",
+    );
     const baseline =
       damageDealers[Math.min(thresholdRank - 1, damageDealers.length - 1)]
         ?.totalDamage ?? 0;
@@ -382,6 +610,7 @@ export default function WclAnalyzer() {
       }
       if (
         player.role !== "tank" &&
+        player.role !== "healer" &&
         baseline > 0 &&
         player.totalDamage < threshold
       ) {
@@ -393,6 +622,7 @@ export default function WclAnalyzer() {
       }
       if (
         player.role !== "tank" &&
+        player.role !== "healer" &&
         maxTankDamage > 0 &&
         player.totalDamage <= maxTankDamage
       ) {
@@ -407,7 +637,7 @@ export default function WclAnalyzer() {
         tags.push({
           label: `尾${tail}`,
           tone: "violet",
-          title: `全局小怪伤害倒数第 ${tail} 名（已过滤坦克）`,
+          title: `全局小怪伤害倒数第 ${tail} 名（已过滤坦克与治疗）`,
         });
       }
       if (player.boostedDamage > 0) {
@@ -439,6 +669,20 @@ export default function WclAnalyzer() {
   const selectedPlayer =
     rankedPlayers.find((player) => player.id === selectedPlayerId) ??
     rankedPlayers[0];
+  const selectedAbilityRows =
+    selectedPlayer?.role === "healer" && selectedPlayer.topHeals?.length
+      ? selectedPlayer.topHeals.map((spell) => ({
+          name: spell.name,
+          value: spell.healing,
+        }))
+      : (selectedPlayer?.topSpells ?? []).map((spell) => ({
+          name: spell.name,
+          value: spell.damage,
+        }));
+  const selectedPrimaryTotal =
+    selectedPlayer?.role === "healer"
+      ? (selectedPlayer.healingDone ?? 0) + (selectedPlayer.absorbDone ?? 0)
+      : selectedPlayer?.totalDamage ?? 0;
 
   const selectedDuration = useMemo(
     () =>
@@ -503,16 +747,228 @@ export default function WclAnalyzer() {
     0,
   );
 
+  const stopLiveTracking = (announce = true) => {
+    if (livePollTimerRef.current !== null) {
+      window.clearTimeout(livePollTimerRef.current);
+      livePollTimerRef.current = null;
+    }
+    liveWorkerRef.current?.terminate();
+    liveWorkerRef.current = null;
+    liveSourceRef.current = null;
+    liveOffsetRef.current = 0;
+    liveAppendPendingRef.current = false;
+    livePollBusyRef.current = false;
+    setLiveStatus("idle");
+    setLiveFileName("");
+    if (announce) setToast("已停止实时跟踪，当前报告保留在页面中");
+  };
+
+  const scheduleLivePoll = () => {
+    if (!liveWorkerRef.current || !liveSourceRef.current) return;
+    if (livePollTimerRef.current !== null) {
+      window.clearTimeout(livePollTimerRef.current);
+    }
+    livePollTimerRef.current = window.setTimeout(() => {
+      void pollLiveFile();
+    }, 2_500);
+  };
+
+  const beginLiveSession = (file: File, source: LiveLogSource) => {
+    liveWorkerRef.current?.terminate();
+    const worker = createCombatLogWorker();
+    const requestId = liveRequestIdRef.current + 1;
+    liveWorkerRef.current = worker;
+    liveSourceRef.current = source;
+    liveRequestIdRef.current = requestId;
+    liveOffsetRef.current = 0;
+    liveAppendPendingRef.current = false;
+    setLiveStatus("starting");
+    setLiveFileName(file.name);
+    setProcessing(true);
+    setProgress(1);
+    setProgressMessage("正在后台建立实时日志索引");
+    setError("");
+
+    worker.onmessage = (event: MessageEvent<CombatLogWorkerResponse>) => {
+      const message = event.data;
+      if (message.requestId !== liveRequestIdRef.current) return;
+      if (message.type === "progress") {
+        setProgress(message.progress);
+        setProgressMessage(message.message);
+        return;
+      }
+      if (message.type === "live-ready") {
+        liveOffsetRef.current = message.sourceSize;
+        liveAppendPendingRef.current = false;
+        setLastFile(file);
+        activateReport(message.report, "local");
+        setLiveStatus("watching");
+        setLiveLastUpdate(new Date());
+        setProcessing(false);
+        setProgress(100);
+        setToast("实时解析已启动：后续只读取日志新增部分");
+        scheduleLivePoll();
+        return;
+      }
+      if (message.type === "live-update") {
+        liveOffsetRef.current = message.sourceSize;
+        liveAppendPendingRef.current = false;
+        setReport((current) =>
+          mergeLiveReport(current, message.report, message.fightCount),
+        );
+        setReportKind("local");
+        setActiveFightIds((current) => {
+          const next = new Set(current);
+          message.report.fights.forEach((fight) => next.add(fight.id));
+          return next;
+        });
+        setFightWeights((current) => ({
+          ...current,
+          ...Object.fromEntries(
+            message.report.fights.map((fight) => [
+              fight.id,
+              current[fight.id] ?? 100,
+            ]),
+          ),
+        }));
+        setLiveLastUpdate(new Date());
+        return;
+      }
+      if (message.type === "error") {
+        setError(`实时解析中断：${message.message}`);
+        setProcessing(false);
+        stopLiveTracking(false);
+      }
+    };
+    worker.onerror = (event) => {
+      setError(event.message || "实时日志解析线程异常");
+      setProcessing(false);
+      stopLiveTracking(false);
+    };
+    const options: ParseOptions = {
+      startTime: startTime || undefined,
+      endTime: endTime || undefined,
+      mergePets: true,
+    };
+    worker.postMessage({ type: "live-start", requestId, file, options });
+  };
+
+  async function pollLiveFile() {
+    const source = liveSourceRef.current;
+    const worker = liveWorkerRef.current;
+    if (!source || !worker || livePollBusyRef.current) return;
+    if (liveAppendPendingRef.current) {
+      scheduleLivePoll();
+      return;
+    }
+    livePollBusyRef.current = true;
+    let restarted = false;
+    try {
+      const offset = liveOffsetRef.current;
+      const growth = await source.readGrowth(offset);
+      if (growth.rotated || growth.size < offset) {
+        restarted = true;
+        setToast("检测到日志被清空或轮转，正在重新建立索引");
+        beginLiveSession(await source.getInitialFile(), source);
+        return;
+      }
+      if (growth.size > offset && growth.chunk?.byteLength) {
+        const chunk = growth.chunk;
+        liveAppendPendingRef.current = true;
+        worker.postMessage(
+          {
+            type: "live-append",
+            requestId: liveRequestIdRef.current,
+            sourceSize: growth.size,
+            chunk,
+          },
+          [chunk],
+        );
+      }
+    } catch (reason) {
+      setError(
+        reason instanceof Error
+          ? `读取实时日志失败：${reason.message}`
+          : "读取实时日志失败",
+      );
+    } finally {
+      livePollBusyRef.current = false;
+      if (!restarted) scheduleLivePoll();
+    }
+  }
+
+  const startLiveTracking = async (forceLocalPath = false) => {
+    if (liveStatus !== "idle") {
+      stopLiveTracking();
+      return;
+    }
+    const picker = forceLocalPath
+      ? undefined
+      : (window as FilePickerWindow).showOpenFilePicker;
+    if (!picker && (!localPreview || !livePath.trim())) {
+      setError(
+        localPreview
+          ? "当前内置浏览器需要填写 WoWCombatLog 的绝对路径，才能通过 localhost 只读助手实时跟踪。"
+          : "当前浏览器不支持持续文件授权。请使用最新版 Chrome / Edge 后再启用实时跟踪。",
+      );
+      return;
+    }
+    try {
+      let source: LiveLogSource;
+      if (picker) {
+        const [handle] = await picker({
+          multiple: false,
+          types: [
+            {
+              description: "魔兽世界战斗日志",
+              accept: { "text/plain": [".txt", ".log"] },
+            },
+          ],
+        });
+        if (!handle) return;
+        source = fileHandleLiveSource(handle);
+      } else {
+        source = localPathLiveSource(livePath);
+        setProcessing(true);
+        setProgress(1);
+        setProgressMessage("正在通过 localhost 读取初始日志");
+      }
+      const file = await source.getInitialFile();
+      if (!picker) setLiveHelperAvailable(true);
+      beginLiveSession(file, source);
+    } catch (reason) {
+      setProcessing(false);
+      if (reason instanceof DOMException && reason.name === "AbortError") return;
+      const message = reason instanceof Error ? reason.message : "无法开始实时跟踪";
+      setError(
+        !picker && message.toLowerCase().includes("fetch")
+          ? "localhost 实时助手未启动。请重新运行 pnpm run dev 后再试。"
+          : message,
+      );
+    }
+  };
+
+  const toggleTheme = () => {
+    setTheme((current) => {
+      const next = current === "dark" ? "light" : "dark";
+      document.documentElement.dataset.theme = next;
+      document.documentElement.style.colorScheme = next;
+      window.localStorage.setItem("time-scar-theme", next);
+      return next;
+    });
+  };
+
   const openFilePicker = () => fileInputRef.current?.click();
 
   const handleFile = async (file: File) => {
+    stopLiveTracking(false);
     setProcessing(true);
     setProgress(2);
     setProgressMessage("正在读取日志文件");
     setError("");
     setLastFile(file);
     try {
-      const parsed = await parseCombatLogFile(
+      const parsed = await parseCombatLogFileInWorker(
         file,
         {
           startTime: startTime || undefined,
@@ -547,10 +1003,12 @@ export default function WclAnalyzer() {
   };
 
   const resetDemo = () => {
+    stopLiveTracking(false);
     activateReport(createDemoReport(), "demo");
+    setDemoReportVisible(true);
     setLastFile(null);
     window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
-    setToast("已切换到演示报告");
+    setToast("已打开界面演示，内容均为非真实数据");
   };
 
   const shareReport = async () => {
@@ -620,32 +1078,45 @@ export default function WclAnalyzer() {
 
   const reportKindLabel =
     reportKind === "demo"
-      ? "演示数据"
+      ? "界面演示 · 非真实日志"
       : reportKind === "shared"
         ? "分享报告"
         : "本地日志";
+  const reportVisible = reportKind !== "demo" || demoReportVisible;
 
   return (
     <div className="site-shell">
       <header className="site-header">
         <a className="brand" href="#top" aria-label="返回页面顶部">
           <span className="brand-mark" aria-hidden="true">
-            <span>战</span>
+            <span>时</span>
           </span>
           <span className="brand-copy">
-            <strong>战痕</strong>
+            <strong>时光战痕</strong>
             <small>时光服 WCL 分析台</small>
           </span>
         </a>
         <nav className="top-nav" aria-label="主要导航">
-          <a href="#report">报告</a>
-          <a href="#rules">统计规则</a>
+          <a href="#report">{reportVisible ? "报告" : "导入日志"}</a>
+          {reportVisible ? <a href="#replay">战斗复盘</a> : null}
+          {reportVisible ? <a href="#rules">统计规则</a> : null}
+          <a href="#phases">阶段表</a>
           <a href="#guide">方法说明</a>
         </nav>
         <div className="header-actions">
-          <span className="local-pill">
+          <button
+            className="theme-toggle"
+            type="button"
+            onClick={toggleTheme}
+            aria-label={`切换到${theme === "dark" ? "浅色" : "深色"}模式`}
+            title={`当前为${theme === "dark" ? "深色" : "浅色"}模式`}
+          >
+            <span aria-hidden="true">{theme === "dark" ? "☀" : "☾"}</span>
+            <b>{theme === "dark" ? "浅色" : "深色"}</b>
+          </button>
+          <span className={`local-pill ${liveStatus === "watching" ? "is-live" : ""}`}>
             <span className="status-dot" />
-            原始日志不上传
+            {liveStatus === "watching" ? "实时解析中" : "原始日志不上传"}
           </span>
           <button className="button button-primary button-compact" type="button" onClick={openFilePicker}>
             选择日志
@@ -666,8 +1137,9 @@ export default function WclAnalyzer() {
               <span>别让 WCL 排队耽误分 G。</span>
             </h1>
             <p>
-              在浏览器本地解析 <strong>WoWCombatLog.txt</strong>，按接近 WCL
-              的团队考核口径生成伤害排行、合格线、关键减益覆盖与开怪记录。原始日志不会离开你的设备。
+              在浏览器本地解析 <strong>WoWCombatLog.txt</strong>，按可调整的团队考核口径
+              生成团队统计，并按 Boss 和角色还原技能、血量、Buff、Debuff、治疗与承伤时间轴。
+              核心事件直接读取，职业识别与 Boss 专属规则会明确标注为近似。
             </p>
             <div className="hero-points" aria-label="产品特点">
               <span><b>10–30 秒</b>典型日志</span>
@@ -678,9 +1150,6 @@ export default function WclAnalyzer() {
               <button className="button button-primary" type="button" onClick={openFilePicker}>
                 <span aria-hidden="true">＋</span>
                 选择 WoWCombatLog.txt
-              </button>
-              <button className="button button-ghost" type="button" onClick={resetDemo}>
-                查看演示报告
               </button>
             </div>
           </div>
@@ -731,6 +1200,66 @@ export default function WclAnalyzer() {
                   </button>
                 </>
               )}
+              <div className={`live-import ${liveStatus !== "idle" ? "is-active" : ""}`}>
+                <button
+                  type="button"
+                  onClick={() => void startLiveTracking()}
+                  aria-pressed={liveStatus !== "idle"}
+                >
+                  <span aria-hidden="true">
+                    {liveStatus === "watching" ? "■" : "●"}
+                  </span>
+                  {liveStatus === "starting"
+                    ? "取消实时索引"
+                    : liveStatus === "watching"
+                      ? "停止实时跟踪"
+                      : "实时跟踪正在写入的日志"}
+                </button>
+                {localPreview ? (
+                  <details
+                    className="live-path-disclosure"
+                    open={!liveSupported ? true : undefined}
+                  >
+                    <summary>内置浏览器 / 本地路径模式</summary>
+                    <label className="live-path-field">
+                      <span>日志绝对路径</span>
+                      <input
+                        type="text"
+                        value={livePath}
+                        onChange={(event) => setLivePath(event.target.value)}
+                        placeholder="/Users/你的名字/.../Logs/WoWCombatLog.txt"
+                        disabled={liveStatus !== "idle"}
+                        spellCheck={false}
+                      />
+                    </label>
+                    <button
+                      className="live-path-start"
+                      type="button"
+                      onClick={() => void startLiveTracking(true)}
+                      disabled={liveStatus !== "idle" || !livePath.trim()}
+                    >
+                      用此路径开始实时跟踪
+                    </button>
+                  </details>
+                ) : null}
+                <p>
+                  {liveStatus === "watching"
+                    ? `${liveFileName} · 仅增量读取新增字节${
+                        liveLastUpdate
+                          ? ` · ${liveLastUpdate.toLocaleTimeString("zh-CN", {
+                              hour12: false,
+                            })} 已同步`
+                          : ""
+                      }`
+                    : liveSupported
+                      ? "首次授权后每 2.5 秒检查新增内容；不会重复解析整份文件。"
+                      : localPreview
+                        ? liveHelperAvailable
+                          ? "localhost 只读助手已连接；每 2.5 秒仅读取新增字节。"
+                          : "localhost 只读助手未连接；重新运行 pnpm run dev 后会自动启动。"
+                        : "需要支持文件持续授权的 Chrome / Edge 浏览器。"}
+                </p>
+              </div>
               <div className="time-filter">
                 <label>
                   <span>开始时间</span>
@@ -758,7 +1287,8 @@ export default function WclAnalyzer() {
               <span className="privacy-icon" aria-hidden="true">⌁</span>
               <p>
                 <strong>隐私说明</strong>
-                只读取战斗事件；分享链接不包含原始文本、聊天或账号信息。
+                原始日志只在浏览器内解析；技能图标仅按 Spell ID
+                请求公开图标，不发送原始文本、聊天或账号信息。
               </p>
             </div>
           </div>
@@ -772,12 +1302,29 @@ export default function WclAnalyzer() {
           </div>
         ) : null}
 
+        {reportVisible ? (
         <section className="report-section" id="report">
+          {reportKind === "demo" ? (
+            <div className="demo-report-warning" role="note">
+              <span>演</span>
+              <p>
+                <strong>当前是界面演示，不是真实战斗日志</strong>
+                页面中的玩家、伤害、Boss、时间轴和结论均为虚构数据，仅用于查看交互效果。
+              </p>
+            </div>
+          ) : null}
           <div className="report-heading">
             <div>
               <div className="section-label">
-                <span>{reportKindLabel}</span>
-                <span>解析器 v{report.parserVersion}</span>
+                <span className={reportKind === "demo" ? "demo-label" : undefined}>
+                  {reportKindLabel}
+                </span>
+                <span>核心事件解析器 v{report.parserVersion}</span>
+                <span>
+                  {report.advancedLogging
+                    ? `高级日志${report.logVersion ? ` v${report.logVersion}` : ""}`
+                    : "标准日志"}
+                </span>
               </div>
               <h2>{report.raidName}</h2>
               <p>
@@ -785,7 +1332,25 @@ export default function WclAnalyzer() {
               </p>
             </div>
             <div className="report-actions">
-              {lastFile ? (
+              {reportKind === "demo" ? (
+                <button
+                  className="button button-ghost button-compact"
+                  type="button"
+                  onClick={() => setDemoReportVisible(false)}
+                >
+                  收起界面演示
+                </button>
+              ) : null}
+              {reportKind !== "demo" && liveStatus !== "idle" ? (
+                <button
+                  className="button button-live button-compact"
+                  type="button"
+                  onClick={() => stopLiveTracking()}
+                >
+                  <span aria-hidden="true">●</span>
+                  {liveStatus === "watching" ? "实时同步中" : "建立实时索引"}
+                </button>
+              ) : reportKind !== "demo" && lastFile ? (
                 <button
                   className="button button-ghost button-compact"
                   type="button"
@@ -795,12 +1360,16 @@ export default function WclAnalyzer() {
                   重新解析
                 </button>
               ) : null}
-              <button className="button button-ghost button-compact" type="button" onClick={exportCsv}>
-                导出 CSV
-              </button>
-              <button className="button button-gold button-compact" type="button" onClick={() => void shareReport()}>
-                生成分享链接
-              </button>
+              {reportKind !== "demo" ? (
+                <>
+                  <button className="button button-ghost button-compact" type="button" onClick={exportCsv}>
+                    导出 CSV
+                  </button>
+                  <button className="button button-gold button-compact" type="button" onClick={() => void shareReport()}>
+                    生成分享链接
+                  </button>
+                </>
+              ) : null}
             </div>
           </div>
 
@@ -1013,19 +1582,21 @@ export default function WclAnalyzer() {
                       <h4>{selectedPlayer.name}</h4>
                     </div>
                     <span className="detail-total">
-                      <small>当前口径</small>
-                      <strong>{formatNumber(selectedPlayer.totalDamage)}</strong>
+                      <small>
+                        {selectedPlayer.role === "healer" ? "治疗 + 吸收" : "当前口径"}
+                      </small>
+                      <strong>{formatNumber(selectedPrimaryTotal)}</strong>
                     </span>
                   </div>
                   <div className="spell-list">
-                    {selectedPlayer.topSpells.map((spell, index) => {
-                      const topValue = selectedPlayer.topSpells[0]?.damage || 1;
+                    {selectedAbilityRows.map((spell, index) => {
+                      const topValue = selectedAbilityRows[0]?.value || 1;
                       return (
                         <div className="spell-row" key={spell.name}>
                           <span>{index + 1}</span>
                           <strong>{spell.name}</strong>
-                          <div><i style={{ width: `${(spell.damage / topValue) * 100}%` }} /></div>
-                          <b>{formatCompact(spell.damage)}</b>
+                          <div><i style={{ width: `${(spell.value / topValue) * 100}%` }} /></div>
+                          <b>{formatCompact(spell.value)}</b>
                         </div>
                       );
                     })}
@@ -1033,6 +1604,8 @@ export default function WclAnalyzer() {
                   <div className="detail-stats">
                     <span>承伤 <b>{formatCompact(selectedPlayer.damageTaken)}</b></span>
                     <span>宠物贡献 <b>{formatCompact(selectedPlayer.petDamage)}</b></span>
+                    <span>有效治疗 <b>{formatCompact(selectedPlayer.healingDone ?? 0)}</b></span>
+                    <span>吸收贡献 <b>{formatCompact(selectedPlayer.absorbDone ?? 0)}</b></span>
                     <span>临时增伤 <b>{formatCompact(selectedPlayer.boostedDamage)}</b></span>
                   </div>
                 </div>
@@ -1042,7 +1615,7 @@ export default function WclAnalyzer() {
             <aside className="panel rules-panel" id="rules">
               <div className="panel-header">
                 <div>
-                  <span className="panel-kicker">WCL-LIKE RULES</span>
+                  <span className="panel-kicker">LOCAL RAID RULES</span>
                   <h3>Boss 战斗场次</h3>
                 </div>
                 <span className="rule-count">{activeFightIds.size}/{report.fights.length}</span>
@@ -1051,15 +1624,15 @@ export default function WclAnalyzer() {
               <div className="rule-preset">
                 <div>
                   <span className="preset-icon">W</span>
-                  <p><strong>时光服通用口径</strong><small>仅击杀 · 宠物归属 · 增伤剔除</small></p>
+                  <p><strong>WCL 基础口径</strong><small>仅击杀 · 宠物归属 · 实际有效量</small></p>
                 </div>
                 <span>已启用</span>
               </div>
 
               <label className="switch-row">
                 <span>
-                  <strong>剔除临时增伤伤害</strong>
-                  <small>双子精华、邪恶狂热等已识别光环</small>
+                  <strong>自定义：剔除临时增伤伤害</strong>
+                  <small>默认关闭；开启后不再等同于 WCL Damage Done</small>
                 </span>
                 <input
                   type="checkbox"
@@ -1166,6 +1739,12 @@ export default function WclAnalyzer() {
             </aside>
           </div>
 
+          <CombatReplay
+            report={report}
+            selectedPlayerId={selectedPlayer?.id ?? ""}
+            onSelectPlayer={setSelectedPlayerId}
+          />
+
           <div className="review-grid">
             <section className="panel aura-panel">
               <div className="panel-header">
@@ -1253,6 +1832,72 @@ export default function WclAnalyzer() {
             </div>
           ) : null}
         </section>
+        ) : (
+          <section
+            className="report-placeholder"
+            id="report"
+            aria-labelledby="report-placeholder-title"
+          >
+            <div className="report-placeholder-copy">
+              <span className="report-placeholder-mark" aria-hidden="true">真</span>
+              <div>
+                <small>REAL LOG REQUIRED</small>
+                <h2 id="report-placeholder-title">导入真实日志后显示分析报告</h2>
+                <p>演示数据已默认收起，避免与真实玩家、Boss 和战斗结论混淆。</p>
+              </div>
+            </div>
+            <details className="demo-disclosure">
+              <summary>
+                查看界面演示
+                <span>非真实数据</span>
+              </summary>
+              <div>
+                <p>仅用于预览页面布局和交互；其中所有角色、数值、时间轴与结论均为虚构内容。</p>
+                <button className="button button-ghost button-compact" type="button" onClick={resetDemo}>
+                  打开非真实演示
+                </button>
+              </div>
+            </details>
+          </section>
+        )}
+
+        <section className="phase-section" id="phases">
+          <div className="phase-heading">
+            <div>
+              <span className="eyebrow">
+                <span className="eyebrow-line" />
+                TITAN REFORGED · RAID PHASES
+              </span>
+              <h2>时光服阶段副本表</h2>
+            </div>
+            <p>
+              P1–P4 按官方开放公告校准；P5–P11 来自当前游戏内团队成就预览，
+              尚未开放的阶段仍以之后的官方公告为准。
+            </p>
+          </div>
+          <div className="phase-grid">
+            {TITAN_PHASES.map((item) => (
+              <article
+                className={`phase-card ${item.status === "official" ? "official" : "preview"}`}
+                key={item.phase}
+              >
+                <div>
+                  <strong>{item.phase}</strong>
+                  <span>
+                    {item.status === "official" ? "已有官方公告" : "游戏内成就预览"}
+                  </span>
+                </div>
+                <p>{item.raids}</p>
+              </article>
+            ))}
+          </div>
+          <div className="phase-note">
+            <span>已修正</span>
+            <p>
+              纳克萨玛斯属于 <strong>P3</strong>，与黑曜石圣殿、永恒之眼同阶段。
+            </p>
+          </div>
+        </section>
 
         <section className="guide-section" id="guide">
           <div className="guide-heading">
@@ -1261,7 +1906,7 @@ export default function WclAnalyzer() {
               HOW IT WORKS
             </span>
             <h2>一份日志，三步给出能行动的结论。</h2>
-            <p>首版先解决大众团最耗时间的统计与筛选；严谨排名、百分位和职业循环仍以 WCL 为准。</p>
+              <p>团队汇总和逐事件复盘都在本机完成；官方排名、百分位和 Boss 专属口径仍以 WCL 为准。</p>
           </div>
           <div className="guide-cards">
             <article>
@@ -1272,9 +1917,9 @@ export default function WclAnalyzer() {
             </article>
             <article>
               <span>02</span>
-              <h3>按团规切口径</h3>
-              <p>秒切仅 Boss、全日志或小怪；可排除场次、目标和临时增伤，并调整单场权重。</p>
-              <b>不用重新上传</b>
+              <h3>按角色复盘</h3>
+              <p>在同一时间轴核对技能、Boss 血量、个人 Buff、目标 Debuff、治疗、承伤和操作空窗。</p>
+              <b>毫秒级事件可追溯</b>
             </article>
             <article>
               <span>03</span>
@@ -1283,21 +1928,64 @@ export default function WclAnalyzer() {
               <b>不包含聊天与账号信息</b>
             </article>
           </div>
+          <div className="parser-proof">
+            <div className="parser-proof-heading">
+              <span>解析边界</span>
+              <h3>能处理真实日志，但不冒充完整 WCL。</h3>
+              <p>
+                解析器已按高级战斗日志 v9 的单位快照字段校准，并用整份实战日志回归；
+                页面会把直接读取、启发式推断和仍需 WCL 的部分分开说明。
+              </p>
+            </div>
+            <div className="parser-proof-grid">
+              <article className="verified">
+                <span>已验证</span>
+                <strong>核心战斗与复盘事件</strong>
+                <p>伤害、治疗、吸收、施法成败、未命中、打断、驱散、死亡、单位血量快照与光环区间。</p>
+              </article>
+              <article className="estimated">
+                <span>通用近似</span>
+                <strong>团队复盘标签</strong>
+                <p>职业与角色、开怪人、关键光环覆盖、临时增伤识别会受技能、目标和日志完整度影响。</p>
+              </article>
+              <article className="external">
+                <span>仍需 WCL</span>
+                <strong>官方排名口径</strong>
+                <p>Boss 专属排除规则、百分位、专精循环、日志外缺失的主人关系与官方榜单不会伪造。</p>
+              </article>
+            </div>
+          </div>
         </section>
       </main>
 
       <footer className="site-footer">
         <div className="brand footer-brand">
-          <span className="brand-mark" aria-hidden="true"><span>战</span></span>
-          <span className="brand-copy"><strong>战痕</strong><small>Raid logs, made readable.</small></span>
+          <span className="brand-mark" aria-hidden="true"><span>时</span></span>
+          <span className="brand-copy"><strong>时光战痕</strong><small>Raid logs, made readable.</small></span>
         </div>
         <p>
           社区非官方工具原型，与 Blizzard Entertainment、Warcraft Logs
           无隶属关系。最终结算请以团队规则和 WCL 官方数据为准。
         </p>
-        <a href="https://bbs.nga.cn/read.php?tid=46923197" target="_blank" rel="noreferrer">
-          灵感来源：NGA 原帖
-        </a>
+        <nav className="footer-links" aria-label="项目相关链接">
+          <a
+            className="footer-link footer-link-github"
+            href="https://github.com/liven666/time-scar-wcl-analyzer"
+            target="_blank"
+            rel="noreferrer"
+          >
+            <span className="footer-link-mark" aria-hidden="true">GH</span>
+            GitHub 源码
+          </a>
+          <a
+            className="footer-link"
+            href="https://bbs.nga.cn/read.php?tid=46923197"
+            target="_blank"
+            rel="noreferrer"
+          >
+            灵感来源：NGA 原帖
+          </a>
+        </nav>
       </footer>
 
       {toast ? <div className="toast" role="status">{toast}</div> : null}
