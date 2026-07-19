@@ -142,7 +142,7 @@ test("normalizes WCL events into the same comparison profile", () => {
 test("matches Chinese and English names for the same boss", () => {
   assert.equal(
     isSameBoss(
-      { bossName: "高阶祭司温诺希斯" },
+      { bossName: "*高阶祭司温诺希斯*" },
       { bossName: "High Priest Venoxis" },
     ),
     true,
@@ -182,8 +182,50 @@ test("localizes WCL-only abilities and buffs by stable spell ID", () => {
 
   assert.equal(profile.bossName, "高阶祭司温诺希斯");
   assert.equal(profile.abilities.find((ability) => ability.id === "1")?.name, "近战");
-  assert.equal(profile.auras.find((aura) => aura.id === "60439")?.name, "洛欧塞布的阴影");
-  assert.equal(profile.auras.find((aura) => aura.id === "59620")?.name, "狂暴");
+  assert.equal(
+    profile.auras.find((aura) => aura.id === "60439")?.name,
+    "洛欧塞布之影（饰品主动）",
+  );
+  assert.equal(
+    profile.auras.find((aura) => aura.id === "59620")?.name,
+    "狂暴（武器附魔触发）",
+  );
+});
+
+test("localizes raw WCL boss and aura names before generating insights", () => {
+  const local = {
+    ...buildLocalComparisonProfile(localReport(), "fight-7", playerId),
+    bossName: "*高阶祭司温诺希斯*",
+    auras: [],
+  };
+  const benchmark = {
+    ...local,
+    source: "wcl" as const,
+    bossName: "High Priest Venoxis",
+    playerId: "7",
+    playerName: "基准惩戒骑",
+    auras: [
+      {
+        id: "60439",
+        name: "Loatheb's Shadow",
+        uptimeMs: 4_700,
+        applications: 1,
+      },
+      {
+        id: "59620",
+        name: "Berserk",
+        uptimeMs: 5_400,
+        applications: 3,
+      },
+    ],
+  };
+
+  const result = comparePlayerProfiles(local, benchmark);
+  const insightTitles = result.insights.map((insight) => insight.title).join("\n");
+  assert.equal(result.sameBoss, true);
+  assert.match(insightTitles, /洛欧塞布之影（饰品主动）/);
+  assert.match(insightTitles, /狂暴（武器附魔触发）/);
+  assert.doesNotMatch(insightTitles, /Loatheb's Shadow|Berserk/);
 });
 
 test("prefers the uploaded Chinese spell dictionary for unknown WCL names", () => {

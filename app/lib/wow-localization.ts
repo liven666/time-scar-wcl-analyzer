@@ -1,4 +1,4 @@
-const NAME_SEPARATOR_PATTERN = /[\s·'’`\-_:：()（）]/g;
+const NAME_SEPARATOR_PATTERN = /[\p{P}\p{S}\s]+/gu;
 
 function normalizedName(value: string): string {
   return value.normalize("NFKC").toLowerCase().replace(NAME_SEPARATOR_PATTERN, "");
@@ -133,7 +133,7 @@ const SPELL_NAMES_ZH: Record<string, string> = {
   "48806": "愤怒之锤",
   "48819": "奉献",
   "48934": "强效力量祝福",
-  "50334": "狂暴",
+  "50334": "狂暴（德鲁伊）",
   "53385": "神圣风暴",
   "53760": "无尽怒气合剂",
   "53908": "加速",
@@ -141,9 +141,9 @@ const SPELL_NAMES_ZH: Record<string, string> = {
   "57371": "进食充分",
   "57623": "寒冬号角",
   "59578": "战争艺术",
-  "59620": "狂暴",
+  "59620": "狂暴（武器附魔触发）",
   "60229": "伟大",
-  "60439": "洛欧塞布的阴影",
+  "60439": "洛欧塞布之影（饰品主动）",
   "61840": "正义复仇",
   "63944": "新生希望",
   "67371": "神圣力量",
@@ -181,7 +181,7 @@ const SPELL_NAME_ALIASES_ZH: Record<string, string> = {
   hornofwinter: "寒冬号角",
   judgementofvengeance: "复仇审判",
   lionheart: "狮心",
-  loathebsshadow: "洛欧塞布的阴影",
+  loathebsshadow: "洛欧塞布之影（饰品主动）",
   markofthewild: "野性印记",
   powerwordshield: "真言术：盾",
   righteousvengeance: "正义复仇",

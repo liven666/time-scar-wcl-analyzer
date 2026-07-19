@@ -698,9 +698,14 @@ function displayName(profile: ComparisonProfile): string {
 }
 
 export function comparePlayerProfiles(
-  local: ComparisonProfile,
-  benchmark: ComparisonProfile,
+  localInput: ComparisonProfile,
+  benchmarkInput: ComparisonProfile,
 ): PlayerComparisonResult {
+  // Keep the comparison core safe even when a caller passes a raw WCL profile.
+  // This prevents English boss, ability and aura names from leaking into
+  // same-Boss checks or generated insight copy.
+  const local = localizeComparisonProfile(localInput);
+  const benchmark = localizeComparisonProfile(benchmarkInput);
   const primaryMetric: ComparisonPrimaryMetric =
     local.role === "healer" ||
     local.totalHealing + local.totalAbsorb > local.totalDamage * 1.5
