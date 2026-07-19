@@ -15,6 +15,7 @@ import {
   type CombatLogWorkerResponse,
 } from "./lib/combat-log-client";
 import CombatReplay from "./CombatReplay";
+import PlayerComparison from "./PlayerComparison";
 import {
   type CSSProperties,
   type ChangeEvent,
@@ -194,31 +195,19 @@ const AURA_LABELS: Record<
   },
 };
 
-const TITAN_PHASES = [
-  { phase: "P1", raids: "熔火之心", status: "official" },
-  { phase: "P2", raids: "风暴要塞 · 毒蛇神殿", status: "official" },
-  {
-    phase: "P3",
-    raids: "纳克萨玛斯 · 黑曜石圣殿 · 永恒之眼",
-    status: "official",
-  },
-  { phase: "P4", raids: "十字军的试炼 · 祖尔格拉布", status: "official" },
-  { phase: "P5", raids: "太阳之井高地 · 祖阿曼", status: "preview" },
-  { phase: "P6", raids: "奥杜尔", status: "preview" },
-  {
-    phase: "P7",
-    raids: "卡拉赞 · 格鲁尔的巢穴 · 玛瑟里顿的巢穴",
-    status: "preview",
-  },
-  {
-    phase: "P8",
-    raids: "黑翼之巢 · 奥妮克希亚的巢穴 · 安其拉废墟",
-    status: "preview",
-  },
-  { phase: "P9", raids: "安其拉神殿", status: "preview" },
-  { phase: "P10", raids: "冰冠堡垒 · 红玉圣殿", status: "preview" },
-  { phase: "P11", raids: "黑暗神殿 · 海加尔山之战", status: "preview" },
-] as const;
+const TITAN_PHASE_STATUS = {
+  phase: "P4",
+  season: "荆棘之路",
+  raids: "十字军的试炼 · 祖尔格拉布",
+  startedAt: "2026.05.28",
+  currentWeek: 8,
+  estimatedRemaining: "不足 2 周",
+  nextPhase: "P5",
+  nextWindow: "7 月 23 日—7 月 30 日",
+  updatedAt: "2026.07.19",
+  historicalCadence: "8 / 9 / 8 周",
+  officialNotice: "https://wow.blizzard.cn/news/trr/20260528/43039_1302020.html",
+} as const;
 
 const numberFormatter = new Intl.NumberFormat("zh-CN");
 
@@ -669,16 +658,84 @@ export default function WclAnalyzer() {
   const selectedPlayer =
     rankedPlayers.find((player) => player.id === selectedPlayerId) ??
     rankedPlayers[0];
-  const selectedAbilityRows =
-    selectedPlayer?.role === "healer" && selectedPlayer.topHeals?.length
-      ? selectedPlayer.topHeals.map((spell) => ({
-          name: spell.name,
-          value: spell.healing,
-        }))
-      : (selectedPlayer?.topSpells ?? []).map((spell) => ({
-          name: spell.name,
-          value: spell.damage,
-        }));
+  const selectedAbilityRows = useMemo(() => {
+    if (!selectedPlayer) return [];
+    const values = new Map<
+      string,
+      { spellId?: number; name: string; value: number }
+    >();
+    const add = (rawId: string | number | undefined, name: string, value: number) => {
+      const key = rawId === undefined ? name : String(rawId);
+      const current = values.get(key);
+      if (current) current.value += value;
+      else {
+        const parsedId = rawId === undefined ? undefined : Number(rawId);
+        values.set(key, {
+          spellId: Number.isFinite(parsedId) ? parsedId : undefined,
+          name,
+          value,
+        });
+      }
+    };
+
+    if (view === "boss" && selectedPlayer.role === "healer") {
+      for (const fight of selectedFights) {
+        const weight = (fightWeights[fight.id] ?? 100) / 100;
+        for (const [abilityId, healing] of Object.entries(
+          fight.actorHeals?.[selectedPlayer.id] ?? {},
+        )) {
+          add(
+            abilityId,
+            report.spellNames?.[abilityId] ?? `技能 ${abilityId}`,
+            healing * weight,
+          );
+        }
+      }
+    } else if (view === "boss") {
+      for (const fight of selectedFights) {
+        const weight = (fightWeights[fight.id] ?? 100) / 100;
+        for (const [abilityId, targets] of Object.entries(
+          fight.actorSpellTargets?.[selectedPlayer.id] ?? {},
+        )) {
+          const damage = Object.entries(targets).reduce(
+            (sum, [target, amount]) =>
+              excludedTargets.has(target) ? sum : sum + amount,
+            0,
+          );
+          add(
+            abilityId,
+            report.spellNames?.[abilityId] ?? `技能 ${abilityId}`,
+            damage * weight,
+          );
+        }
+      }
+    }
+
+    // Older shared reports do not contain per-fight ability aggregates. The
+    // complete global list remains a compatible fallback for those reports
+    // and for the full/trash views.
+    if (!values.size) {
+      if (selectedPlayer.role === "healer" && selectedPlayer.topHeals?.length) {
+        for (const spell of selectedPlayer.topHeals) {
+          add(spell.spellId, spell.name, spell.healing);
+        }
+      } else {
+        for (const spell of selectedPlayer.topSpells ?? []) {
+          add(spell.spellId, spell.name, spell.damage);
+        }
+      }
+    }
+    return [...values.values()]
+      .filter((spell) => spell.value > 0)
+      .sort((a, b) => b.value - a.value || a.name.localeCompare(b.name, "zh-CN"));
+  }, [
+    excludedTargets,
+    fightWeights,
+    report.spellNames,
+    selectedFights,
+    selectedPlayer,
+    view,
+  ]);
   const selectedPrimaryTotal =
     selectedPlayer?.role === "healer"
       ? (selectedPlayer.healingDone ?? 0) + (selectedPlayer.absorbDone ?? 0)
@@ -721,7 +778,9 @@ export default function WclAnalyzer() {
     const totals: Record<string, number> = {};
     for (const fight of selectedFights) {
       const weight = (fightWeights[fight.id] ?? 100) / 100;
-      for (const [target, damage] of Object.entries(fight.targets)) {
+      for (const [target, damage] of Object.entries(
+        fight.rawTargets ?? fight.targets,
+      )) {
         totals[target] = (totals[target] ?? 0) + damage * weight;
       }
     }
@@ -732,6 +791,48 @@ export default function WclAnalyzer() {
     }
     return Object.entries(totals).sort((a, b) => b[1] - a[1]);
   }, [fightWeights, report.trashTargets, selectedFights, view]);
+
+  const automaticExclusions = useMemo(() => {
+    const values = new Map<
+      string,
+      { damage: number; reasons: Set<string> }
+    >();
+    for (const fight of selectedFights) {
+      const weight = (fightWeights[fight.id] ?? 100) / 100;
+      for (const exclusion of fight.automaticExclusions ?? []) {
+        const current = values.get(exclusion.target) ?? {
+          damage: 0,
+          reasons: new Set<string>(),
+        };
+        current.damage += exclusion.damage * weight;
+        current.reasons.add(exclusion.reason);
+        values.set(exclusion.target, current);
+      }
+    }
+    return values;
+  }, [fightWeights, selectedFights]);
+
+  const automaticAdjustments = useMemo(() => {
+    const values = new Map<
+      string,
+      { label: string; damage: number; reason: string; actorId?: string }
+    >();
+    for (const fight of selectedFights) {
+      const weight = (fightWeights[fight.id] ?? 100) / 100;
+      for (const adjustment of fight.automaticAdjustments ?? []) {
+        const key = `${adjustment.key}:${adjustment.actorId ?? "raid"}`;
+        const current = values.get(key) ?? {
+          label: adjustment.label,
+          damage: 0,
+          reason: adjustment.reason,
+          actorId: adjustment.actorId,
+        };
+        current.damage += adjustment.damage * weight;
+        values.set(key, current);
+      }
+    }
+    return [...values.values()].sort((a, b) => b.damage - a.damage);
+  }, [fightWeights, selectedFights]);
 
   const maxDamage = rankedPlayers[0]?.totalDamage || 1;
   const visiblePlayers = showAll ? rankedPlayers : rankedPlayers.slice(0, 10);
@@ -744,6 +845,14 @@ export default function WclAnalyzer() {
   ).length;
   const excludedTargetDamage = targetTotals.reduce(
     (sum, [target, damage]) => (excludedTargets.has(target) ? sum + damage : sum),
+    0,
+  );
+  const automaticExcludedDamage = [...automaticExclusions.values()].reduce(
+    (sum, exclusion) => sum + exclusion.damage,
+    0,
+  );
+  const automaticAdjustmentDamage = automaticAdjustments.reduce(
+    (sum, adjustment) => sum + adjustment.damage,
     0,
   );
 
@@ -1099,8 +1208,9 @@ export default function WclAnalyzer() {
         <nav className="top-nav" aria-label="主要导航">
           <a href="#report">{reportVisible ? "报告" : "导入日志"}</a>
           {reportVisible ? <a href="#replay">战斗复盘</a> : null}
+          {reportVisible ? <a href="#compare">角色对比</a> : null}
           {reportVisible ? <a href="#rules">统计规则</a> : null}
-          <a href="#phases">阶段表</a>
+          <a href="#phases">赛季进度</a>
           <a href="#guide">方法说明</a>
         </nav>
         <div className="header-actions">
@@ -1129,28 +1239,28 @@ export default function WclAnalyzer() {
           <div className="hero-copy">
             <span className="eyebrow">
               <span className="eyebrow-line" />
-              TITAN REFORGED · RAID REVIEW
+              TITAN REFORGED · PLAYER REVIEW WORKSPACE
             </span>
             <h1>
-              打完就看，
+              战斗结束，
               <br />
-              <span>别让 WCL 排队耽误分 G。</span>
+              <span>复盘才刚开始。</span>
             </h1>
             <p>
-              在浏览器本地解析 <strong>WoWCombatLog.txt</strong>，按可调整的团队考核口径
-              生成团队统计，并按 Boss 和角色还原技能、血量、Buff、Debuff、治疗与承伤时间轴。
-              核心事件直接读取，职业识别与 Boss 专属规则会明确标注为近似。
+              把 <strong>WoWCombatLog.txt</strong> 直接放进浏览器，按 Boss、角色和每次施法
+              还原完整战斗。伤害、治疗、血量、Buff 与操作空窗，都在同一条时间线上看清楚。
             </p>
             <div className="hero-points" aria-label="产品特点">
-              <span><b>10–30 秒</b>典型日志</span>
-              <span><b>0 B</b>原始日志上传</span>
-              <span><b>1 个链接</b>分享汇总</span>
+              <span><small>01</small><b>10–30 秒</b><em>完成典型日志解析</em></span>
+              <span><small>02</small><b>0 B 上传</b><em>原始日志留在本机</em></span>
+              <span><small>03</small><b>逐次施法</b><em>完整时间轴可追溯</em></span>
             </div>
             <div className="hero-actions">
               <button className="button button-primary" type="button" onClick={openFilePicker}>
                 <span aria-hidden="true">＋</span>
-                选择 WoWCombatLog.txt
+                导入战斗日志
               </button>
+              <a className="button button-ghost" href="#guide">先看分析方法</a>
             </div>
           </div>
 
@@ -1172,8 +1282,13 @@ export default function WclAnalyzer() {
                 accept=".txt,.log,text/plain"
                 onChange={onFileChange}
               />
+              <div className="upload-workspace-head">
+                <span><i aria-hidden="true" /> LOCAL COMBAT LOG</span>
+                <b>{processing ? "PARSING" : liveStatus === "watching" ? "LIVE" : "READY"}</b>
+              </div>
               <div className="upload-crest" aria-hidden="true">
-                <span>LOG</span>
+                <span>WCL</span>
+                <small>.LOG</small>
               </div>
               {processing ? (
                 <>
@@ -1192,9 +1307,9 @@ export default function WclAnalyzer() {
                 </>
               ) : (
                 <>
-                  <span className="upload-kicker">拖入即分析</span>
-                  <h2>把战斗日志放到这里</h2>
-                  <p>支持高级战斗日志；数百 MB 文件会分块读取，不占用服务器带宽。</p>
+                  <span className="upload-kicker">DROP TO REVIEW</span>
+                  <h2>放入 WoWCombatLog.txt</h2>
+                  <p>支持高级战斗日志；大文件会在浏览器内分块读取，不占用服务器带宽。</p>
                   <button className="text-button" type="button" onClick={openFilePicker}>
                     或点击选择文件 <span>→</span>
                   </button>
@@ -1415,9 +1530,14 @@ export default function WclAnalyzer() {
               破甲覆盖 <b>{auraCoverage.armor.toFixed(1)}%</b>，精灵之火覆盖{" "}
               <b>{auraCoverage.faerie.toFixed(1)}%</b>；当前合格线下{" "}
               <b>{invalidCount}</b> 人，DPS 不过坦 <b>{underTankCount}</b> 人。
+              {automaticExcludedDamage + automaticAdjustmentDamage > 0
+                ? ` 已按 WCL Boss 规则自动校准 ${formatCompact(
+                    automaticExcludedDamage + automaticAdjustmentDamage,
+                  )}。`
+                : ""}
               {excludedTargetDamage > 0
-                ? ` 已剔除 ${formatCompact(excludedTargetDamage)} 目标伤害。`
-                : " 尚未手动剔除目标伤害。"}
+                ? ` 另手动剔除 ${formatCompact(excludedTargetDamage)}。`
+                : ""}
             </p>
             <span className={`conclusion-state ${invalidCount ? "warn" : "good"}`}>
               {invalidCount ? "建议复盘" : "状态良好"}
@@ -1516,7 +1636,8 @@ export default function WclAnalyzer() {
                           <span className="player-copy">
                             <strong>{player.name}</strong>
                             <small>
-                              {player.className} ·{" "}
+                              {player.className}
+                              {player.specialization ? ` · ${player.specialization}` : ""} ·{" "}
                               <span className={roleStyle(player.role)}>
                                 {ROLE_LABELS[player.role]}
                               </span>
@@ -1578,7 +1699,11 @@ export default function WclAnalyzer() {
                       {CLASS_SHORT[selectedPlayer.className]}
                     </span>
                     <div>
-                      <small>当前选中</small>
+                      <small>
+                        {selectedPlayer.specialization
+                          ? `${selectedPlayer.specialization} · ${selectedPlayer.talentPoints?.join("/") ?? "天赋识别"}`
+                          : "当前选中"}
+                      </small>
                       <h4>{selectedPlayer.name}</h4>
                     </div>
                     <span className="detail-total">
@@ -1588,13 +1713,30 @@ export default function WclAnalyzer() {
                       <strong>{formatNumber(selectedPrimaryTotal)}</strong>
                     </span>
                   </div>
+                  <div className="spell-list-heading">
+                    <strong>完整技能明细</strong>
+                    <span>{selectedAbilityRows.length} 项 · 按技能 ID 分组</span>
+                  </div>
                   <div className="spell-list">
                     {selectedAbilityRows.map((spell, index) => {
                       const topValue = selectedAbilityRows[0]?.value || 1;
                       return (
-                        <div className="spell-row" key={spell.name}>
+                        <div
+                          className="spell-row"
+                          key={spell.spellId ?? spell.name}
+                          title={
+                            spell.spellId !== undefined
+                              ? `${spell.name} · ID ${spell.spellId}`
+                              : spell.name
+                          }
+                        >
                           <span>{index + 1}</span>
-                          <strong>{spell.name}</strong>
+                          <strong>
+                            {spell.name}
+                            {spell.spellId !== undefined ? (
+                              <small>#{spell.spellId}</small>
+                            ) : null}
+                          </strong>
                           <div><i style={{ width: `${(spell.value / topValue) * 100}%` }} /></div>
                           <b>{formatCompact(spell.value)}</b>
                         </div>
@@ -1624,10 +1766,37 @@ export default function WclAnalyzer() {
               <div className="rule-preset">
                 <div>
                   <span className="preset-icon">W</span>
-                  <p><strong>WCL 基础口径</strong><small>仅击杀 · 宠物归属 · 实际有效量</small></p>
+                  <p><strong>WCL 基础口径</strong><small>仅击杀 · 宠物归属 · 完全吸收 · Boss 专属排除</small></p>
                 </div>
                 <span>已启用</span>
               </div>
+
+              {automaticAdjustments.length ? (
+                <div className="automatic-adjustment-list">
+                  {automaticAdjustments.map((adjustment) => {
+                    const actorName = adjustment.actorId
+                      ? report.players.find(
+                          (player) => player.id === adjustment.actorId,
+                        )?.name
+                      : undefined;
+                    return (
+                      <div
+                        key={`${adjustment.label}-${adjustment.actorId ?? "raid"}`}
+                        title={adjustment.reason}
+                      >
+                        <span>自动校准</span>
+                        <p>
+                          <strong>{adjustment.label}</strong>
+                          <small>
+                            {actorName ? `${actorName} · ` : ""}
+                            -{formatCompact(adjustment.damage)}
+                          </small>
+                        </p>
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : null}
 
               <label className="switch-row">
                 <span>
@@ -1714,22 +1883,39 @@ export default function WclAnalyzer() {
                 <button type="button" onClick={() => setRuleTargetsOpen((value) => !value)}>
                   <span>
                     <strong>目标剔除</strong>
-                    <small>{excludedTargets.size} 个目标已排除</small>
+                    <small>
+                      {automaticExclusions.size} 个自动 · {excludedTargets.size} 个手动
+                    </small>
                   </span>
                   <b>{ruleTargetsOpen ? "−" : "+"}</b>
                 </button>
                 {ruleTargetsOpen ? (
                   <div className="target-list">
                     {targetTotals.map(([target, damage]) => {
+                      const automatic = automaticExclusions.get(target);
                       const excluded = excludedTargets.has(target);
                       return (
-                        <label className={excluded ? "excluded" : ""} key={target}>
+                        <label
+                          className={automatic ? "automatic" : excluded ? "excluded" : ""}
+                          key={target}
+                          title={automatic ? [...automatic.reasons].join("；") : undefined}
+                        >
                           <input
                             type="checkbox"
-                            checked={!excluded}
+                            checked={!automatic && !excluded}
                             onChange={() => toggleTarget(target)}
+                            disabled={Boolean(automatic)}
                           />
-                          <span><strong>{target}</strong><small>{formatCompact(damage)}</small></span>
+                          <span>
+                            <strong>
+                              {target}
+                              {automatic ? <em>WCL 自动</em> : null}
+                            </strong>
+                            <small>
+                              {formatCompact(damage)}
+                              {automatic ? ` · 已排除 ${formatCompact(automatic.damage)}` : ""}
+                            </small>
+                          </span>
                         </label>
                       );
                     })}
@@ -1743,6 +1929,11 @@ export default function WclAnalyzer() {
             report={report}
             selectedPlayerId={selectedPlayer?.id ?? ""}
             onSelectPlayer={setSelectedPlayerId}
+          />
+
+          <PlayerComparison
+            report={report}
+            selectedPlayerId={selectedPlayer?.id ?? ""}
           />
 
           <div className="review-grid">
@@ -1866,36 +2057,90 @@ export default function WclAnalyzer() {
             <div>
               <span className="eyebrow">
                 <span className="eyebrow-line" />
-                TITAN REFORGED · RAID PHASES
+                TITAN REFORGED · LIVE PHASE
               </span>
-              <h2>时光服阶段副本表</h2>
+              <h2>当前赛季进度</h2>
             </div>
             <p>
-              P1–P4 按官方开放公告校准；P5–P11 来自当前游戏内团队成就预览，
-              尚未开放的阶段仍以之后的官方公告为准。
+              只展示正在进行的阶段与下一阶段时间预估。资料更新于
+              {` ${TITAN_PHASE_STATUS.updatedAt}`}，正式排期以官方公告为准。
             </p>
           </div>
-          <div className="phase-grid">
-            {TITAN_PHASES.map((item) => (
-              <article
-                className={`phase-card ${item.status === "official" ? "official" : "preview"}`}
-                key={item.phase}
-              >
+          <div className="phase-dashboard">
+            <article className="phase-now-card">
+              <div className="phase-live-label">
+                <span aria-hidden="true" />
+                当前进行中
+              </div>
+              <div className="phase-now-title">
+                <strong>{TITAN_PHASE_STATUS.phase}</strong>
                 <div>
-                  <strong>{item.phase}</strong>
-                  <span>
-                    {item.status === "official" ? "已有官方公告" : "游戏内成就预览"}
-                  </span>
+                  <span>{TITAN_PHASE_STATUS.season}</span>
+                  <h3>{TITAN_PHASE_STATUS.raids}</h3>
                 </div>
-                <p>{item.raids}</p>
-              </article>
-            ))}
-          </div>
-          <div className="phase-note">
-            <span>已修正</span>
-            <p>
-              纳克萨玛斯属于 <strong>P3</strong>，与黑曜石圣殿、永恒之眼同阶段。
-            </p>
+              </div>
+              <div className="phase-week-heading">
+                <div>
+                  <small>阶段进度</small>
+                  <strong>第 {TITAN_PHASE_STATUS.currentWeek} 周</strong>
+                </div>
+                <p>{TITAN_PHASE_STATUS.startedAt} 开始</p>
+              </div>
+              <div
+                className="phase-week-track"
+                role="img"
+                aria-label={`当前为 ${TITAN_PHASE_STATUS.phase} 第 ${TITAN_PHASE_STATUS.currentWeek} 周；下一阶段预计在第 8 至第 9 周之间开启`}
+              >
+                {Array.from({ length: 9 }, (_, index) => {
+                  const week = index + 1;
+                  const state =
+                    week < TITAN_PHASE_STATUS.currentWeek
+                      ? "is-complete"
+                      : week === TITAN_PHASE_STATUS.currentWeek
+                        ? "is-current"
+                        : "is-forecast";
+                  return (
+                    <span className={state} key={week}>
+                      <i aria-hidden="true" />
+                      <b>{week}</b>
+                    </span>
+                  );
+                })}
+              </div>
+              <div className="phase-week-legend" aria-hidden="true">
+                <span>5.28 开始</span>
+                <span>当前 · 第 {TITAN_PHASE_STATUS.currentWeek} 周</span>
+                <span>预估窗口</span>
+              </div>
+            </article>
+
+            <aside className="phase-forecast-card" aria-label="下一阶段预估">
+              <span className="phase-forecast-kicker">PHASE FORECAST</span>
+              <div className="phase-forecast-stat">
+                <small>预计还将持续</small>
+                <strong>{TITAN_PHASE_STATUS.estimatedRemaining}</strong>
+              </div>
+              <div className="phase-next-row">
+                <div>
+                  <small>下一阶段</small>
+                  <strong>{TITAN_PHASE_STATUS.nextPhase}</strong>
+                </div>
+                <time dateTime="2026-07-23">预计 {TITAN_PHASE_STATUS.nextWindow}</time>
+              </div>
+              <p>
+                官方尚未公布 P5 日期。预估参考前三次阶段更替的
+                {` ${TITAN_PHASE_STATUS.historicalCadence} `}
+                节奏，不作为官宣。
+              </p>
+              <a
+                href={TITAN_PHASE_STATUS.officialNotice}
+                target="_blank"
+                rel="noreferrer"
+              >
+                查看 P4 官方公告
+                <span aria-hidden="true">↗</span>
+              </a>
+            </aside>
           </div>
         </section>
 

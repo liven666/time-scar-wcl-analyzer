@@ -43,6 +43,13 @@ function advancedSnapshot(
   ].join(",");
 }
 
+function combatantInfo(
+  playerGuid: string,
+  talents: [number, number, number],
+) {
+  return `COMBATANT_INFO,${playerGuid},${Array(18).fill("0").join(",")},(${talents.join(",")})`;
+}
+
 test("parses real WoW combat-log event shapes and merges summoned pets", () => {
   const mageGuid = "Player-7451-00000001";
   const hunterGuid = "Player-7451-00000002";
@@ -123,7 +130,7 @@ test("parses real WoW combat-log event shapes and merges summoned pets", () => {
   const tank = report.players.find((player) => player.id === tankGuid);
 
   assert.equal(report.raidName, "纳克萨玛斯");
-  assert.equal(report.parserVersion, "0.6.0");
+  assert.equal(report.parserVersion, "0.7.0");
   assert.equal(report.advancedLogging, false);
   assert.equal(fight.success, true);
   assert.equal(fight.durationMs, 10_000);
@@ -236,7 +243,7 @@ test("parses advanced combat log v9 snapshots and Creature guardians", () => {
   const hunter = report.players.find((player) => player.id === hunterGuid);
   const tank = report.players.find((player) => player.id === tankGuid);
 
-  assert.equal(report.parserVersion, "0.6.0");
+  assert.equal(report.parserVersion, "0.7.0");
   assert.equal(report.logVersion, 9);
   assert.equal(report.advancedLogging, true);
   assert.deepEqual(report.zones, ["祖尔格拉布", "十字军的试炼"]);
@@ -512,6 +519,273 @@ test("keeps an active encounter open across incremental live snapshots", () => {
   assert.equal(finalSnapshot.fights.length, 1);
   assert.equal(finalSnapshot.fights[0].success, true);
   assert.equal(finalSnapshot.fights[0].targets["阿努布雷坎"], 3_000);
+});
+
+test("uses COMBATANT_INFO talents before combat heuristics for hybrid roles", () => {
+  const retGuid = "Player-6382-00000101";
+  const protGuid = "Player-6382-00000102";
+  const unholyGuid = "Player-6382-00000103";
+  const bossGuid = "Creature-0-6407-309-33804-15956-0000000101";
+  const lines = [
+    event("7/10/2026 22:30:00.0000", 'ENCOUNTER_START,1107,"天赋木桩",4,25'),
+    event("7/10/2026 22:30:00.0100", combatantInfo(retGuid, [11, 5, 55])),
+    event("7/10/2026 22:30:00.0200", combatantInfo(protGuid, [0, 53, 18])),
+    event("7/10/2026 22:30:00.0300", combatantInfo(unholyGuid, [0, 18, 53])),
+    event(
+      "7/10/2026 22:30:00.1000",
+      `SPELL_DAMAGE,${retGuid},"惩戒样本",${PLAYER_FLAGS},${RAID_FLAGS},${bossGuid},"天赋木桩",${NPC_FLAGS},${RAID_FLAGS},35395,"十字军打击",1,100,0,0,0,0,0,0,0,0`,
+    ),
+    event(
+      "7/10/2026 22:30:00.2000",
+      `SPELL_DAMAGE,${protGuid},"防骑样本",${PLAYER_FLAGS},${RAID_FLAGS},${bossGuid},"天赋木桩",${NPC_FLAGS},${RAID_FLAGS},61411,"正义盾击",1,100,0,0,0,0,0,0,0,0`,
+    ),
+    event(
+      "7/10/2026 22:30:00.3000",
+      `SPELL_DAMAGE,${unholyGuid},"邪恶样本",${PLAYER_FLAGS},${RAID_FLAGS},${bossGuid},"天赋木桩",${NPC_FLAGS},${RAID_FLAGS},55271,"天灾打击",1,100,0,0,0,0,0,0,0,0`,
+    ),
+    event("7/10/2026 22:30:01.0000", 'ENCOUNTER_END,1107,"天赋木桩",4,25,1'),
+  ];
+
+  const report = parseCombatLogText(lines.join("\n"), { mergePets: true });
+  const ret = report.players.find((player) => player.id === retGuid);
+  const prot = report.players.find((player) => player.id === protGuid);
+  const unholy = report.players.find((player) => player.id === unholyGuid);
+
+  assert.deepEqual(ret?.talentPoints, [11, 5, 55]);
+  assert.equal(ret?.specialization, "惩戒");
+  assert.equal(ret?.role, "melee");
+  assert.equal(ret?.roleSource, "talent");
+  assert.equal(prot?.specialization, "防护");
+  assert.equal(prot?.role, "tank");
+  assert.equal(unholy?.specialization, "邪恶");
+  assert.equal(unholy?.role, "melee");
+});
+
+test("retains every custom ability, full absorbs, and WCL target exclusions", () => {
+  const playerGuid = "Player-6382-00000111";
+  const bossGuid = "Creature-0-6407-309-33804-14515-0000000111";
+  const addGuid = "Creature-0-6407-309-33804-15101-0000000112";
+  const lines = [
+    event("7/10/2026 22:31:00.0000", 'ENCOUNTER_START,791,"高阶祭司娅尔罗",4,25'),
+    ...Array.from({ length: 7 }, (_, index) =>
+      event(
+        `7/10/2026 22:31:00.${String(100 + index).padStart(4, "0")}`,
+        `SPELL_DAMAGE,${playerGuid},"时光技能样本",${PLAYER_FLAGS},${RAID_FLAGS},${bossGuid},"高阶祭司娅尔罗",${NPC_FLAGS},${RAID_FLAGS},${1_290_001 + index},"${index < 2 ? "同名时光技能" : `时光技能${index + 1}`}",4,100,0,0,0,0,0,0,0,0`,
+      ),
+    ),
+    event(
+      "7/10/2026 22:31:00.2000",
+      `SPELL_DAMAGE,${playerGuid},"时光技能样本",${PLAYER_FLAGS},${RAID_FLAGS},${addGuid},"祖利安徘徊者",${NPC_FLAGS},${RAID_FLAGS},1290010,"小怪技能",4,500,0,0,0,0,0,0,0,0`,
+    ),
+    event(
+      "7/10/2026 22:31:00.3000",
+      `SPELL_MISSED,${playerGuid},"时光技能样本",${PLAYER_FLAGS},${RAID_FLAGS},${bossGuid},"高阶祭司娅尔罗",${NPC_FLAGS},${RAID_FLAGS},1290011,"完全吸收技能",4,ABSORB,nil,500,500`,
+    ),
+    event("7/10/2026 22:31:01.0000", 'ENCOUNTER_END,791,"高阶祭司娅尔罗",4,25,1'),
+  ];
+
+  const report = parseCombatLogText(lines.join("\n"), { mergePets: true });
+  const fight = report.fights[0];
+  const player = report.players.find((item) => item.id === playerGuid);
+
+  assert.equal(player?.topSpells.length, 9);
+  assert.deepEqual(
+    player?.topSpells
+      .filter((spell) => spell.name === "同名时光技能")
+      .map((spell) => spell.spellId)
+      .sort(),
+    [1_290_001, 1_290_002],
+  );
+  assert.equal(fight.rawTargets?.["祖利安徘徊者"], 500);
+  assert.equal(fight.targets["祖利安徘徊者"], undefined);
+  assert.equal(fight.targets["高阶祭司娅尔罗"], 1_200);
+  assert.equal(fight.automaticExclusions?.[0]?.damage, 500);
+  const absorb = fight.timeline?.events.find(
+    (timelineEvent) => timelineEvent.missType === "ABSORB",
+  );
+  assert.equal(absorb?.amount, 500);
+  assert.equal(absorb?.absorbed, 500);
+});
+
+test("reconciles advanced landed swings and groups time-server guardians", () => {
+  const playerGuid = "Player-6382-00000121";
+  const bossGuid = "Creature-0-6407-309-33804-15956-0000000121";
+  const eagleGuid = "Creature-0-6407-309-33804-260758-0000000122";
+  const phantomEagleGuid = "Creature-0-6407-309-33804-260758-0000000123";
+  const lines = [
+    event(
+      "7/10/2026 22:32:00.0000",
+      "COMBAT_LOG_VERSION,9,ADVANCED_LOG_ENABLED,1,BUILD_VERSION,3.80.1,PROJECT_ID,11",
+    ),
+    event("7/10/2026 22:32:00.0100", 'ENCOUNTER_START,1107,"落地事件木桩",4,25'),
+    event(
+      "7/10/2026 22:32:00.1000",
+      `SWING_DAMAGE,${playerGuid},"落地样本",${PLAYER_FLAGS},${RAID_FLAGS},${bossGuid},"落地事件木桩",${NPC_FLAGS},${RAID_FLAGS},${advancedSnapshot(playerGuid)},1000,1200,0,1,0,0,0,nil,nil,nil`,
+    ),
+    event(
+      "7/10/2026 22:32:00.1230",
+      `SWING_DAMAGE_LANDED,${playerGuid},"落地样本",${PLAYER_FLAGS},${RAID_FLAGS},${bossGuid},"落地事件木桩",${NPC_FLAGS},${RAID_FLAGS},${advancedSnapshot(bossGuid)},1000,1200,600,1,0,0,0,nil,nil,nil`,
+    ),
+    event(
+      "7/10/2026 22:32:00.2000",
+      `SPELL_SUMMON,${playerGuid},"落地样本",${PLAYER_FLAGS},${RAID_FLAGS},${eagleGuid},"雄鹰",0xa28,${RAID_FLAGS},1284200,"雄鹰射击",1`,
+    ),
+    event(
+      "7/10/2026 22:32:00.2100",
+      `SWING_DAMAGE_LANDED,${eagleGuid},"雄鹰",0x2114,${RAID_FLAGS},${bossGuid},"落地事件木桩",${NPC_FLAGS},${RAID_FLAGS},${advancedSnapshot(bossGuid)},250,300,0,1,0,0,0,nil,nil,nil`,
+    ),
+    event(
+      "7/10/2026 22:32:00.2200",
+      `SWING_DAMAGE,${eagleGuid},"雄鹰",0x2114,${RAID_FLAGS},${bossGuid},"落地事件木桩",${NPC_FLAGS},${RAID_FLAGS},${advancedSnapshot(eagleGuid, playerGuid)},250,300,0,1,0,0,0,nil,nil,nil`,
+    ),
+    event(
+      "7/10/2026 22:32:00.3000",
+      `SPELL_SUMMON,${playerGuid},"落地样本",${PLAYER_FLAGS},${RAID_FLAGS},${phantomEagleGuid},"雄鹰",0xa28,${RAID_FLAGS},1284200,"雄鹰射击",1`,
+    ),
+    event(
+      "7/10/2026 22:32:00.3100",
+      `SWING_DAMAGE,${phantomEagleGuid},"雄鹰",0x2114,${RAID_FLAGS},${bossGuid},"落地事件木桩",${NPC_FLAGS},${RAID_FLAGS},${advancedSnapshot(phantomEagleGuid, playerGuid)},300,350,0,1,0,0,0,nil,nil,nil`,
+    ),
+    event("7/10/2026 22:32:01.0000", 'ENCOUNTER_END,1107,"落地事件木桩",4,25,1'),
+  ];
+
+  const report = parseCombatLogText(lines.join("\n"), { mergePets: true });
+  const fight = report.fights[0];
+  const player = report.players.find((item) => item.id === playerGuid);
+
+  assert.equal(fight.targets["落地事件木桩"], 650);
+  assert.equal(fight.actorSpellTargets?.[playerGuid]?.["0"]?.["落地事件木桩"], 400);
+  assert.equal(
+    fight.actorSpellTargets?.[playerGuid]?.["-1284200"]?.["落地事件木桩"],
+    250,
+  );
+  assert.equal(report.spellNames?.["-1284200"], "雄鹰射击");
+  assert.equal(player?.petDamage, 250);
+  assert.equal(
+    fight.timeline?.events.some(
+      (timelineEvent) => timelineEvent.sourceUnitId === phantomEagleGuid,
+    ),
+    false,
+  );
+});
+
+test("matches WCL Hysteria snapshots, overkill, and landed-swing timing", () => {
+  const casterGuid = "Player-6382-00000125";
+  const recipientGuid = "Player-6382-00000126";
+  const bossGuid = "Creature-0-6407-309-33804-15956-0000000125";
+  const lines = [
+    event("7/10/2026 22:32:10.0000", 'ENCOUNTER_START,1107,"增伤木桩",4,25'),
+    event(
+      "7/10/2026 22:32:10.1000",
+      `SPELL_AURA_APPLIED,${recipientGuid},"快照野德",${PLAYER_FLAGS},${RAID_FLAGS},${bossGuid},"增伤木桩",${NPC_FLAGS},${RAID_FLAGS},49800,"割裂",1,DEBUFF`,
+    ),
+    event(
+      "7/10/2026 22:32:10.2000",
+      `SPELL_CAST_SUCCESS,${casterGuid},"增伤冰DK",${PLAYER_FLAGS},${RAID_FLAGS},${recipientGuid},"快照野德",${PLAYER_FLAGS},${RAID_FLAGS},49016,"邪恶狂热",1`,
+    ),
+    event(
+      "7/10/2026 22:32:10.2010",
+      `SPELL_AURA_APPLIED,${casterGuid},"增伤冰DK",${PLAYER_FLAGS},${RAID_FLAGS},${recipientGuid},"快照野德",${PLAYER_FLAGS},${RAID_FLAGS},49016,"邪恶狂热",1,BUFF`,
+    ),
+    event(
+      "7/10/2026 22:32:10.3000",
+      `SPELL_PERIODIC_DAMAGE,${recipientGuid},"快照野德",${PLAYER_FLAGS},${RAID_FLAGS},${bossGuid},"增伤木桩",${NPC_FLAGS},${RAID_FLAGS},49800,"割裂",1,600,0,1,0,0,0,0,0,0`,
+    ),
+    event(
+      "7/10/2026 22:32:10.4000",
+      `SPELL_DAMAGE,${recipientGuid},"快照野德",${PLAYER_FLAGS},${RAID_FLAGS},${bossGuid},"增伤木桩",${NPC_FLAGS},${RAID_FLAGS},62078,"横扫（豹）",1,1200,600,1,0,60,0,0,0,0`,
+    ),
+    event(
+      "7/10/2026 22:32:10.5000",
+      `SPELL_AURA_REMOVED,${recipientGuid},"快照野德",${PLAYER_FLAGS},${RAID_FLAGS},${bossGuid},"增伤木桩",${NPC_FLAGS},${RAID_FLAGS},49800,"割裂",1,DEBUFF`,
+    ),
+    event(
+      "7/10/2026 22:32:10.6000",
+      `SPELL_AURA_APPLIED,${recipientGuid},"快照野德",${PLAYER_FLAGS},${RAID_FLAGS},${bossGuid},"增伤木桩",${NPC_FLAGS},${RAID_FLAGS},49800,"割裂",1,DEBUFF`,
+    ),
+    event(
+      "7/10/2026 22:32:10.7000",
+      `SPELL_AURA_REMOVED,${casterGuid},"增伤冰DK",${PLAYER_FLAGS},${RAID_FLAGS},${recipientGuid},"快照野德",${PLAYER_FLAGS},${RAID_FLAGS},49016,"邪恶狂热",1,BUFF`,
+    ),
+    event(
+      "7/10/2026 22:32:10.8000",
+      `SPELL_PERIODIC_DAMAGE,${recipientGuid},"快照野德",${PLAYER_FLAGS},${RAID_FLAGS},${bossGuid},"增伤木桩",${NPC_FLAGS},${RAID_FLAGS},49800,"割裂",1,1200,0,1,0,0,0,0,0,0`,
+    ),
+    event(
+      "7/10/2026 22:32:11.0000",
+      `SWING_DAMAGE,${recipientGuid},"快照野德",${PLAYER_FLAGS},${RAID_FLAGS},${bossGuid},"增伤木桩",${NPC_FLAGS},${RAID_FLAGS},${advancedSnapshot(recipientGuid)},1926,2100,-1,1,0,0,0,nil,nil,nil`,
+    ),
+    event(
+      "7/10/2026 22:32:11.0010",
+      `SPELL_CAST_SUCCESS,${casterGuid},"增伤冰DK",${PLAYER_FLAGS},${RAID_FLAGS},${recipientGuid},"快照野德",${PLAYER_FLAGS},${RAID_FLAGS},49016,"邪恶狂热",1`,
+    ),
+    event(
+      "7/10/2026 22:32:11.0010",
+      `SWING_DAMAGE_LANDED,${recipientGuid},"快照野德",${PLAYER_FLAGS},${RAID_FLAGS},${bossGuid},"增伤木桩",${NPC_FLAGS},${RAID_FLAGS},${advancedSnapshot(bossGuid)},1926,2100,-1,1,0,0,0,nil,nil,nil`,
+    ),
+    event(
+      "7/10/2026 22:32:11.0010",
+      `SPELL_AURA_APPLIED,${casterGuid},"增伤冰DK",${PLAYER_FLAGS},${RAID_FLAGS},${recipientGuid},"快照野德",${PLAYER_FLAGS},${RAID_FLAGS},49016,"邪恶狂热",1,BUFF`,
+    ),
+    event("7/10/2026 22:32:12.0000", 'ENCOUNTER_END,1107,"增伤木桩",4,25,1'),
+  ];
+
+  const report = parseCombatLogText(lines.join("\n"), { mergePets: true });
+  const fight = report.fights[0];
+
+  assert.equal(fight.targets["增伤木桩"], 4_326);
+  assert.equal(fight.actorTargets[recipientGuid]["增伤木桩"], 3_705);
+  assert.equal(fight.actorTargets[casterGuid]["增伤木桩"], 621);
+  assert.equal(
+    fight.actorSpellTargets?.[casterGuid]?.["-49016"]?.["增伤木桩"],
+    621,
+  );
+  assert.equal(
+    fight.actorSpellTargets?.[recipientGuid]?.["49800"]?.["增伤木桩"],
+    1_600,
+  );
+  assert.equal(
+    fight.actorSpellTargets?.[recipientGuid]?.["62078"]?.["增伤木桩"],
+    500,
+  );
+  assert.equal(
+    fight.actorSpellTargets?.[recipientGuid]?.["0"]?.["增伤木桩"],
+    1_605,
+  );
+});
+
+test("applies WCL Jaraxxus and Twin Valkyr normalization rules", () => {
+  const playerGuid = "Player-6382-00000131";
+  const jaraxxusGuid = "Creature-0-6505-649-26134-34780-0000000131";
+  const twinGuid = "Creature-0-6505-649-26134-34497-0000000132";
+  const lines = [
+    event("7/10/2026 22:33:00.0000", 'ENCOUNTER_START,633,"加拉克苏斯大王",4,25'),
+    event(
+      "7/10/2026 22:33:00.0100",
+      `SPELL_AURA_APPLIED,${playerGuid},"归一化法师",${PLAYER_FLAGS},${RAID_FLAGS},${playerGuid},"归一化法师",${PLAYER_FLAGS},${RAID_FLAGS},66228,"虚空之能",4,BUFF`,
+    ),
+    event(
+      "7/10/2026 22:33:00.1000",
+      `SPELL_DAMAGE,${playerGuid},"归一化法师",${PLAYER_FLAGS},${RAID_FLAGS},${jaraxxusGuid},"加拉克苏斯大王",${NPC_FLAGS},${RAID_FLAGS},42833,"火球术",4,1000,0,0,0,0,0,0,0,0`,
+    ),
+    event("7/10/2026 22:33:01.0000", 'ENCOUNTER_END,633,"加拉克苏斯大王",4,25,1'),
+    event("7/10/2026 22:34:00.0000", 'ENCOUNTER_START,641,"瓦格里双子",4,25'),
+    event(
+      "7/10/2026 22:34:00.0100",
+      `SPELL_AURA_APPLIED,${playerGuid},"归一化法师",${PLAYER_FLAGS},${RAID_FLAGS},${playerGuid},"归一化法师",${PLAYER_FLAGS},${RAID_FLAGS},900001,"光明增效",2,BUFF`,
+    ),
+    event(
+      "7/10/2026 22:34:00.1000",
+      `SPELL_DAMAGE,${playerGuid},"归一化法师",${PLAYER_FLAGS},${RAID_FLAGS},${twinGuid},"黑暗邪使菲奥拉",${NPC_FLAGS},${RAID_FLAGS},42833,"火球术",4,1000,0,0,0,0,0,0,0,0`,
+    ),
+    event("7/10/2026 22:34:01.0000", 'ENCOUNTER_END,641,"瓦格里双子",4,25,1'),
+  ];
+
+  const report = parseCombatLogText(lines.join("\n"), { mergePets: true });
+  assert.equal(report.fights[0].targets["加拉克苏斯大王"], 833);
+  assert.equal(report.fights[0].automaticAdjustments?.[0]?.damage, 167);
+  assert.equal(report.fights[1].targets["黑暗邪使菲奥拉"], 500);
+  assert.equal(report.fights[1].automaticAdjustments?.[0]?.damage, 500);
 });
 
 test("builds one-player operations from casts, effects and failures", () => {

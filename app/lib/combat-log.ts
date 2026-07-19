@@ -12,6 +12,7 @@ export type WowClass =
   | "未知";
 
 export type CombatRole = "tank" | "healer" | "melee" | "ranged" | "unknown";
+export type CombatRoleSource = "talent" | "talent+combat" | "combat";
 export type AuraMetric = "armor" | "faerie" | "demonic";
 export type TimelineEventKind =
   | "damage"
@@ -84,17 +85,35 @@ export interface PlayerMeta {
   name: string;
   className: WowClass;
   role: CombatRole;
+  specialization?: string;
+  talentPoints?: [number, number, number];
+  roleSource?: CombatRoleSource;
   damageTaken: number;
   petDamage: number;
   healingDone?: number;
   overhealing?: number;
   absorbDone?: number;
-  topSpells: Array<{ name: string; damage: number }>;
-  topHeals?: Array<{ name: string; healing: number }>;
+  topSpells: Array<{ spellId?: number; name: string; damage: number }>;
+  topHeals?: Array<{ spellId?: number; name: string; healing: number }>;
+}
+
+export interface FightTargetExclusion {
+  target: string;
+  damage: number;
+  reason: string;
+}
+
+export interface FightAutomaticAdjustment {
+  key: string;
+  label: string;
+  damage: number;
+  reason: string;
+  actorId?: string;
 }
 
 export interface FightResult {
   id: string;
+  encounterId?: string;
   name: string;
   startMs: number;
   endMs: number;
@@ -105,6 +124,15 @@ export interface FightResult {
   pullMethod: string;
   actorTargets: Record<string, Record<string, number>>;
   targets: Record<string, number>;
+  rawActorTargets?: Record<string, Record<string, number>>;
+  rawTargets?: Record<string, number>;
+  automaticExclusions?: FightTargetExclusion[];
+  automaticAdjustments?: FightAutomaticAdjustment[];
+  actorSpellTargets?: Record<
+    string,
+    Record<string, Record<string, number>>
+  >;
+  actorHeals?: Record<string, Record<string, number>>;
   boostedByActor: Record<string, number>;
   auraMs: Record<AuraMetric, number>;
   timeline?: FightTimeline;
@@ -155,14 +183,16 @@ interface ActorAccumulator {
   externalHealingDone: number;
   overhealing: number;
   absorbDone: number;
-  spells: Map<string, number>;
-  heals: Map<string, number>;
+  spells: Map<number, number>;
+  heals: Map<number, number>;
+  talentLoadouts: Map<string, number>;
   seenInEncounter: boolean;
   seenCombatantInfo: boolean;
 }
 
 interface FightAccumulator {
   id: string;
+  encounterId: string;
   name: string;
   startMs: number;
   endMs: number;
@@ -172,12 +202,41 @@ interface FightAccumulator {
   pullMethod: string;
   actorTargets: Map<string, Map<string, number>>;
   targets: Map<string, number>;
+  actorSpellTargets: Map<string, Map<number, Map<string, number>>>;
+  actorHeals: Map<string, Map<number, number>>;
   targetDamageByGuid: Map<string, number>;
-  boostedByActor: Map<string, number>;
+  boostedActorTargets: Map<string, Map<string, number>>;
+  normalizationByActor: Map<string, number>;
+  twinNormalizationByActor: Map<string, number>;
   auraMs: Record<AuraMetric, number>;
   timelineEvents: CombatTimelineEvent[];
   auraWindows: CombatAuraWindow[];
   activeAuraWindowIndexes: Map<string, number>;
+}
+
+interface PendingSwingEvent {
+  timestampMs: number;
+  event: CombatTimelineEvent;
+  actorId?: string;
+  actorSpellId?: number;
+  targetName?: string;
+  targetGuid?: string;
+  fromPet?: boolean;
+  fight?: FightAccumulator;
+  boosted?: boolean;
+  twinBoosted?: boolean;
+  oldRankingAmount?: number;
+  oldNormalizedAmount?: number;
+  oldTwinAdjustment?: number;
+  oldActorAmount?: number;
+  supportActorId?: string;
+  supportSpellId?: number;
+  oldSupportAmount?: number;
+}
+
+interface PendingLandedSwing {
+  timestampMs: number;
+  payload: DamagePayload;
 }
 
 interface ActiveAura {
@@ -194,6 +253,13 @@ interface GlobalAuraState {
   auraType: "BUFF" | "DEBUFF";
   stacks: number;
 }
+
+interface ActiveSupportAttribution {
+  sourceActorId: string;
+  spellId: number;
+}
+
+type PeriodicSupportSnapshot = ActiveSupportAttribution | null;
 
 const DAMAGE_EVENTS = new Set([
   "SWING_DAMAGE",
@@ -213,6 +279,8 @@ const AURA_EVENTS = new Set([
   "SPELL_AURA_REMOVED",
   "SPELL_AURA_REMOVED_DOSE",
 ]);
+
+const CUSTOM_GUARDIAN_DAMAGE_ORIGINS = new Set([1284179, 1284200]);
 
 const CLASS_RULES: Array<{
   className: WowClass;
@@ -289,6 +357,145 @@ const RANGED_DRUID_SPELLS =
 
 const MELEE_DRUID_SPELLS =
   /撕碎|裂伤|割裂|横扫|Shred|Mangle|Rip|Swipe/i;
+
+const SPECIALIZATION_TREES: Partial<Record<WowClass, readonly [string, string, string]>> = {
+  死亡骑士: ["鲜血", "冰霜", "邪恶"],
+  德鲁伊: ["平衡", "野性战斗", "恢复"],
+  猎人: ["野兽控制", "射击", "生存"],
+  法师: ["奥术", "火焰", "冰霜"],
+  圣骑士: ["神圣", "防护", "惩戒"],
+  牧师: ["戒律", "神圣", "暗影"],
+  潜行者: ["刺杀", "战斗", "敏锐"],
+  萨满祭司: ["元素", "增强", "恢复"],
+  术士: ["痛苦", "恶魔学识", "毁灭"],
+  战士: ["武器", "狂怒", "防护"],
+};
+
+const WCL_TARGET_EXCLUSIONS: Record<
+  string,
+  Record<string, string>
+> = {
+  // WCL 的默认 Damage Done 会保留战斗事件与时间轴，但从该 Boss
+  // 的排名伤害中移除这些机制目标。
+  "791": {
+    祖利安徘徊者: "WCL 娅尔罗口径：潜行者阶段小怪不计排名伤害",
+  },
+  "792": {
+    祭品巨魔: "WCL 金度口径：祭品机制目标不计排名伤害",
+    老鼠: "环境生物不计 Boss 排名伤害",
+  },
+  "790": {
+    钩齿狂鱼: "WCL 加兹兰卡口径：召来的鱼群不计排名伤害",
+  },
+  "786": {
+    蜘蛛: "环境生物不计 Boss 排名伤害",
+  },
+};
+
+function dominantTalentTree(
+  points: [number, number, number],
+): 0 | 1 | 2 {
+  let index: 0 | 1 | 2 = 0;
+  if (points[1] > points[index]) index = 1;
+  if (points[2] > points[index]) index = 2;
+  return index;
+}
+
+function parseCombatantTalents(
+  fields: string[],
+): [number, number, number] | undefined {
+  // Advanced log v9 writes (tree1,tree2,tree3). The regular CSV tokenizer
+  // intentionally keeps compatibility with combat events, so this tuple is
+  // split across three fields and reconstructed here.
+  for (let index = 20; index < Math.min(fields.length - 2, 36); index += 1) {
+    const tuple = `${fields[index]},${fields[index + 1]},${fields[index + 2]}`;
+    const match = tuple.match(/^\((\d+),(\d+),(\d+)\)$/);
+    if (!match) continue;
+    return [Number(match[1]), Number(match[2]), Number(match[3])];
+  }
+  return undefined;
+}
+
+function selectedTalentPoints(
+  actor: ActorAccumulator,
+): [number, number, number] | undefined {
+  const loadout = [...actor.talentLoadouts.entries()].sort(
+    (a, b) => b[1] - a[1],
+  )[0]?.[0];
+  if (!loadout) return undefined;
+  const values = loadout.split("/").map(Number);
+  if (values.length !== 3 || values.some((value) => !Number.isFinite(value))) {
+    return undefined;
+  }
+  return [values[0], values[1], values[2]];
+}
+
+function talentIdentity(
+  className: WowClass,
+  points: [number, number, number] | undefined,
+  combatTank: boolean,
+): {
+  specialization?: string;
+  role?: CombatRole;
+  roleSource?: CombatRoleSource;
+} {
+  if (!points) return {};
+  const trees = SPECIALIZATION_TREES[className];
+  if (!trees) return {};
+  const tree = dominantTalentTree(points);
+  const specialization = trees[tree];
+
+  if (className === "圣骑士") {
+    return {
+      specialization,
+      role: tree === 0 ? "healer" : tree === 1 ? "tank" : "melee",
+      roleSource: "talent",
+    };
+  }
+  if (className === "牧师") {
+    return {
+      specialization,
+      role: tree === 2 ? "ranged" : "healer",
+      roleSource: "talent",
+    };
+  }
+  if (className === "萨满祭司") {
+    return {
+      specialization,
+      role: tree === 0 ? "ranged" : tree === 1 ? "melee" : "healer",
+      roleSource: "talent",
+    };
+  }
+  if (className === "战士") {
+    return {
+      specialization,
+      role: tree === 2 ? "tank" : "melee",
+      roleSource: "talent",
+    };
+  }
+  if (className === "德鲁伊") {
+    return {
+      specialization,
+      role:
+        tree === 0 ? "ranged" : tree === 2 ? "healer" : combatTank ? "tank" : "melee",
+      roleSource: tree === 1 ? "talent+combat" : "talent",
+    };
+  }
+  if (className === "死亡骑士") {
+    return {
+      specialization,
+      role: tree === 0 && combatTank ? "tank" : "melee",
+      roleSource: tree === 0 ? "talent+combat" : "talent",
+    };
+  }
+  if (className === "猎人" || className === "法师" || className === "术士") {
+    return { specialization, role: "ranged", roleSource: "talent" };
+  }
+  if (className === "潜行者") {
+    return { specialization, role: "melee", roleSource: "talent" };
+  }
+  return { specialization };
+}
 
 const BOOST_AURA_PATTERN =
   /光明精华|黑暗精华|邪恶狂热|Light Essence|Dark Essence|Unholy Frenzy/i;
@@ -500,6 +707,7 @@ function parseAdvancedSnapshot(
 
 interface DamagePayload {
   amount: number;
+  landedAmount: number;
   rawAmount: number;
   overkill: number;
   resisted: number;
@@ -534,6 +742,7 @@ function parseDamagePayload(fields: string[], event: string): DamagePayload {
   const overkill = numeric(fields[overkillIndex]);
   return {
     amount: Math.max(0, landedAmount - overkill),
+    landedAmount,
     rawAmount: rawAmount || landedAmount,
     overkill,
     resisted: numeric(fields[amountIndex + 3 + advancedShift]),
@@ -547,6 +756,16 @@ function parseDamagePayload(fields: string[], event: string): DamagePayload {
       ? parseAdvancedSnapshot(fields, snapshotStart)
       : undefined,
   };
+}
+
+function supportDamageContribution(
+  payload: DamagePayload,
+  rankingCap: number,
+): number {
+  return Math.min(
+    rankingCap,
+    Math.floor((payload.amount + payload.absorbed) / 6),
+  );
 }
 
 interface HealPayload {
@@ -596,6 +815,31 @@ function addToNestedMap(
   map.set(actorId, actorTargets);
 }
 
+function addToActorSpellTargets(
+  map: Map<string, Map<number, Map<string, number>>>,
+  actorId: string,
+  spell: number,
+  target: string,
+  amount: number,
+) {
+  const actorSpells = map.get(actorId) ?? new Map<number, Map<string, number>>();
+  const targets = actorSpells.get(spell) ?? new Map<string, number>();
+  targets.set(target, (targets.get(target) ?? 0) + amount);
+  actorSpells.set(spell, targets);
+  map.set(actorId, actorSpells);
+}
+
+function addToActorSpellAmounts(
+  map: Map<string, Map<number, number>>,
+  actorId: string,
+  spell: number,
+  amount: number,
+) {
+  const spells = map.get(actorId) ?? new Map<number, number>();
+  spells.set(spell, (spells.get(spell) ?? 0) + amount);
+  map.set(actorId, spells);
+}
+
 function mapToRecord(map: Map<string, number>): Record<string, number> {
   return Object.fromEntries(map.entries());
 }
@@ -605,6 +849,68 @@ function nestedMapToRecord(
 ): Record<string, Record<string, number>> {
   return Object.fromEntries(
     [...map.entries()].map(([key, value]) => [key, mapToRecord(value)]),
+  );
+}
+
+function actorSpellTargetsToRecord(
+  map: Map<string, Map<number, Map<string, number>>>,
+  excludedTargets: ReadonlySet<string> = new Set(),
+): Record<string, Record<string, Record<string, number>>> {
+  return Object.fromEntries(
+    [...map.entries()].map(([actorId, spells]) => [
+      actorId,
+      Object.fromEntries(
+        [...spells.entries()].map(([abilityId, targets]) => [
+          String(abilityId),
+          Object.fromEntries(
+            [...targets.entries()].filter(
+              ([target]) => !excludedTargets.has(target),
+            ),
+          ),
+        ]),
+      ),
+    ]),
+  );
+}
+
+function actorSpellAmountsToRecord(
+  map: Map<string, Map<number, number>>,
+): Record<string, Record<string, number>> {
+  return Object.fromEntries(
+    [...map.entries()].map(([actorId, spells]) => [
+      actorId,
+      Object.fromEntries(
+        [...spells.entries()].map(([abilityId, amount]) => [
+          String(abilityId),
+          amount,
+        ]),
+      ),
+    ]),
+  );
+}
+
+function filterNestedTargets(
+  map: Map<string, Map<string, number>>,
+  excludedTargets: ReadonlySet<string>,
+): Record<string, Record<string, number>> {
+  return Object.fromEntries(
+    [...map.entries()].map(([actorId, targets]) => [
+      actorId,
+      Object.fromEntries(
+        [...targets.entries()].filter(
+          ([target]) => !excludedTargets.has(target),
+        ),
+      ),
+    ]),
+  );
+}
+
+function filterTargets(
+  map: Map<string, number>,
+  excludedTargets: ReadonlySet<string>,
+): Record<string, number> {
+  return Object.fromEntries(
+    [...map.entries()].filter(([target]) => !excludedTargets.has(target)),
   );
 }
 
@@ -625,6 +931,7 @@ class CombatLogParser {
   private sourceSize: number;
   private readonly actors = new Map<string, ActorAccumulator>();
   private readonly petOwners = new Map<string, string>();
+  private readonly guardianOriginSpells = new Map<string, number>();
   private readonly ownedUnitNameOwners = new Map<string, Set<string>>();
   private readonly spellNames = new Map<number, string>([
     [0, "近战"],
@@ -640,8 +947,25 @@ class CombatLogParser {
   private readonly activeAuraStarts = new Map<string, number>();
   private readonly activeBoostAuras = new Set<string>();
   private readonly activeBoostCounts = new Map<string, number>();
+  private readonly activeSupportAttribution = new Map<
+    string,
+    ActiveSupportAttribution
+  >();
+  private readonly periodicSupportSnapshots = new Map<
+    string,
+    PeriodicSupportSnapshot
+  >();
+  private readonly activeVoidPowerStacks = new Map<string, number>();
+  private readonly activeTwinEmpowerment = new Map<
+    string,
+    "light" | "dark"
+  >();
   private readonly globalAuras = new Map<string, GlobalAuraState>();
-  private readonly pendingSwingEvents = new Map<string, CombatTimelineEvent[]>();
+  private readonly pendingSwingEvents = new Map<string, PendingSwingEvent[]>();
+  private readonly pendingLandedSwings = new Map<
+    string,
+    PendingLandedSwing[]
+  >();
   private readonly lastIncomingByTarget = new Map<
     string,
     CombatTimelineEvent
@@ -719,6 +1043,14 @@ class CombatLogParser {
         const actor = this.ensureActor(playerGuid, "未知玩家");
         actor.seenCombatantInfo = true;
         actor.seenInEncounter ||= Boolean(this.currentFight);
+        const talents = parseCombatantTalents(fields);
+        if (talents) {
+          const key = talents.join("/");
+          actor.talentLoadouts.set(
+            key,
+            (actor.talentLoadouts.get(key) ?? 0) + 1,
+          );
+        }
       }
       return;
     }
@@ -735,6 +1067,14 @@ class CombatLogParser {
       if (ownerGuid && isOwnableUnitGuid(summonedGuid)) {
         this.linkOwner(summonedGuid, ownerGuid);
         this.rememberOwnedUnitName(fields[6], ownerGuid);
+        const originSpellId = this.registerSpell(fields[9], fields[10]);
+        if (CUSTOM_GUARDIAN_DAMAGE_ORIGINS.has(originSpellId)) {
+          this.guardianOriginSpells.set(summonedGuid, originSpellId);
+          this.spellNames.set(
+            -originSpellId,
+            safeName(fields[10], `技能 ${originSpellId}`),
+          );
+        }
       }
     }
 
@@ -845,6 +1185,7 @@ class CombatLogParser {
       absorbDone: 0,
       spells: new Map(),
       heals: new Map(),
+      talentLoadouts: new Map(),
       seenInEncounter: false,
       seenCombatantInfo: false,
     };
@@ -973,10 +1314,13 @@ class CombatLogParser {
 
   private startFight(fields: string[], timestampMs: number, label: string) {
     if (this.currentFight) this.finishCurrentFight(timestampMs, false);
+    this.activeVoidPowerStacks.clear();
+    this.activeTwinEmpowerment.clear();
     const encounterId = safeName(fields[1], String(this.fights.length + 1));
     const name = safeName(fields[2], `Boss战 ${this.fights.length + 1}`);
     const fight: FightAccumulator = {
       id: `${encounterId}-${timestampMs}`,
+      encounterId,
       name,
       startMs: timestampMs,
       endMs: timestampMs,
@@ -986,8 +1330,12 @@ class CombatLogParser {
       pullMethod: "等待首个有效伤害事件",
       actorTargets: new Map(),
       targets: new Map(),
+      actorSpellTargets: new Map(),
+      actorHeals: new Map(),
       targetDamageByGuid: new Map(),
-      boostedByActor: new Map(),
+      boostedActorTargets: new Map(),
+      normalizationByActor: new Map(),
+      twinNormalizationByActor: new Map(),
       auraMs: { armor: 0, faerie: 0, demonic: 0 },
       timelineEvents: [],
       auraWindows: [],
@@ -1011,9 +1359,12 @@ class CombatLogParser {
     if (!this.currentFight) return;
     this.currentFight.endMs = Math.max(timestampMs, this.currentFight.startMs + 1);
     this.currentFight.success = success;
+    this.discardUnconfirmedSwingEvents();
     this.closeAurasForFight(this.currentFight, this.currentFight.endMs);
     this.closeTimelineAuras(this.currentFight, this.currentFight.endMs);
-    this.pendingSwingEvents.clear();
+    this.pendingLandedSwings.clear();
+    this.activeVoidPowerStacks.clear();
+    this.activeTwinEmpowerment.clear();
     this.currentFight = null;
   }
 
@@ -1046,6 +1397,7 @@ class CombatLogParser {
   }
 
   private consumeAura(fields: string[], event: string, timestampMs: number) {
+    const sourceGuid = fields[1];
     const destGuid = fields[5];
     const spellName = safeName(fields[10], "");
     const rawSpellId = fields[9] || spellName;
@@ -1057,6 +1409,23 @@ class CombatLogParser {
       event === "SPELL_AURA_APPLIED_DOSE" ||
       event === "SPELL_AURA_REFRESH";
     const auraEnded = event === "SPELL_AURA_REMOVED";
+
+    if (
+      isPlayerGuid(sourceGuid) &&
+      destGuid &&
+      fields[12] === "DEBUFF"
+    ) {
+      const snapshotKey = `${sourceGuid}:${destGuid}:${auraSpellId}`;
+      if (auraStarted) {
+        const attribution = this.activeSupportAttribution.get(sourceGuid);
+        this.periodicSupportSnapshots.set(
+          snapshotKey,
+          attribution ? { ...attribution } : null,
+        );
+      } else if (auraEnded) {
+        this.periodicSupportSnapshots.delete(snapshotKey);
+      }
+    }
 
     if (isPlayerGuid(destGuid) && BOOST_AURA_PATTERN.test(spellName)) {
       const boostKey = `${destGuid}:${rawSpellId}`;
@@ -1071,6 +1440,55 @@ class CombatLogParser {
           destGuid,
           Math.max(0, (this.activeBoostCounts.get(destGuid) ?? 1) - 1),
         );
+      }
+    }
+
+    if (
+      isPlayerGuid(destGuid) &&
+      (auraSpellId === 49016 || /邪恶狂热|Hysteria/i.test(spellName))
+    ) {
+      const sourceActorId = this.resolveOwnerGuid(fields[1]);
+      if (auraStarted && sourceActorId && sourceActorId !== destGuid) {
+        this.activeSupportAttribution.set(destGuid, {
+          sourceActorId,
+          spellId: auraSpellId,
+        });
+        this.spellNames.set(-Math.abs(auraSpellId), spellName);
+      } else if (auraEnded) {
+        this.activeSupportAttribution.delete(destGuid);
+      }
+    }
+
+    if (
+      isPlayerGuid(destGuid) &&
+      (auraSpellId === 66228 || /虚空之能|Nether Power/i.test(spellName))
+    ) {
+      if (event === "SPELL_AURA_APPLIED") {
+        this.activeVoidPowerStacks.set(destGuid, 1);
+      } else if (
+        event === "SPELL_AURA_APPLIED_DOSE" ||
+        event === "SPELL_AURA_REMOVED_DOSE"
+      ) {
+        this.activeVoidPowerStacks.set(
+          destGuid,
+          Math.max(1, numeric(fields[13])),
+        );
+      } else if (event === "SPELL_AURA_REMOVED") {
+        this.activeVoidPowerStacks.delete(destGuid);
+      }
+    }
+
+    if (
+      isPlayerGuid(destGuid) &&
+      /光明增效|黑暗增效|Empowered Light|Empowered Darkness/i.test(spellName)
+    ) {
+      if (auraStarted) {
+        this.activeTwinEmpowerment.set(
+          destGuid,
+          /光明增效|Empowered Light/i.test(spellName) ? "light" : "dark",
+        );
+      } else if (auraEnded) {
+        this.activeTwinEmpowerment.delete(destGuid);
       }
     }
 
@@ -1213,6 +1631,7 @@ class CombatLogParser {
     const payload = parseDamagePayload(fields, event);
     this.advancedLogging ||= payload.advanced;
     const amount = payload.amount;
+    const rankingAmount = amount + payload.absorbed;
     const timelineSpellId =
       event === "SWING_DAMAGE"
         ? 0
@@ -1255,8 +1674,11 @@ class CombatLogParser {
         hp: payload.snapshot?.hp,
         maxHp: payload.snapshot?.maxHp,
       });
-      if (event === "SWING_DAMAGE" && incomingEvent) {
-        this.queueSwingEvent(timestampMs, sourceGuid, destGuid, incomingEvent);
+      if (event === "SWING_DAMAGE" && payload.advanced && incomingEvent) {
+        this.queueSwingEvent(timestampMs, sourceGuid, destGuid, {
+          timestampMs,
+          event: incomingEvent,
+        });
       }
       if (incomingEvent && amount > 0) {
         this.lastIncomingByTarget.set(destGuid, incomingEvent);
@@ -1267,7 +1689,7 @@ class CombatLogParser {
       }
     }
 
-    if (!amount) return;
+    if (!rankingAmount) return;
     if (!isDamageTarget(destGuid, destFlags)) return;
 
     let actorGuid = sourceGuid;
@@ -1284,13 +1706,13 @@ class CombatLogParser {
       isOwnableUnitGuid(sourceGuid) &&
       isFriendlyUnit(sourceFlags)
     ) {
-      this.unknownPetDamage += amount;
+      this.unknownPetDamage += rankingAmount;
       const key = sourceGuid || sourceName;
       const source = this.unknownPetSources.get(key) ?? {
         name: sourceName,
         damage: 0,
       };
-      source.damage += amount;
+      source.damage += rankingAmount;
       this.unknownPetSources.set(key, source);
     }
     if (
@@ -1303,7 +1725,7 @@ class CombatLogParser {
 
     const actor = this.ensureActor(actorGuid, actorName);
     actor.seenInEncounter ||= Boolean(this.currentFight);
-    if (fromPet) actor.petDamage += amount;
+    if (fromPet) actor.petDamage += rankingAmount;
     const spellName =
       event === "SWING_DAMAGE"
         ? fromPet
@@ -1315,8 +1737,12 @@ class CombatLogParser {
               "未知环境",
             )}`
         : safeName(fields[10], event);
-    const actorSpellId =
-      event === "SWING_DAMAGE"
+    const guardianOriginSpellId = fromPet
+      ? this.guardianOriginSpells.get(sourceGuid)
+      : undefined;
+    const actorSpellId = guardianOriginSpellId
+      ? -guardianOriginSpellId
+      : event === "SWING_DAMAGE"
         ? fromPet
           ? -1
           : 0
@@ -1324,19 +1750,138 @@ class CombatLogParser {
     if (event === "ENVIRONMENTAL_DAMAGE") {
       this.spellNames.set(-2, spellName);
     }
-    actor.spells.set(spellName, (actor.spells.get(spellName) ?? 0) + amount);
+    const damageSchool =
+      event === "SWING_DAMAGE" ? 1 : Number(fields[11]) || 0;
+    const voidPowerStacks =
+      this.currentFight?.encounterId === "633" &&
+      !fromPet &&
+      sourceGuid === actor.id &&
+      (damageSchool & ~1) !== 0
+        ? this.activeVoidPowerStacks.get(actor.id) ?? 0
+        : 0;
+    const voidNormalizedAmount = voidPowerStacks
+      ? Math.round(rankingAmount / (1 + voidPowerStacks * 0.2))
+      : rankingAmount;
+    const normalizedDamage = Math.max(
+      0,
+      rankingAmount - voidNormalizedAmount,
+    );
+    if (this.currentFight && normalizedDamage > 0) {
+      this.currentFight.normalizationByActor.set(
+        actor.id,
+        (this.currentFight.normalizationByActor.get(actor.id) ?? 0) +
+          normalizedDamage,
+      );
+    }
+    const twinEmpowerment =
+      this.currentFight?.encounterId === "641" &&
+      !fromPet &&
+      sourceGuid === actor.id
+        ? this.activeTwinEmpowerment.get(actor.id)
+        : undefined;
+    const twinBoostedTarget =
+      (twinEmpowerment === "light" && /黑暗邪使/.test(destName)) ||
+      (twinEmpowerment === "dark" && /光明邪使/.test(destName));
+    const normalizedRankingAmount = twinBoostedTarget
+      ? Math.round(voidNormalizedAmount / 2)
+      : voidNormalizedAmount;
+    const twinNormalizedDamage = Math.max(
+      0,
+      voidNormalizedAmount - normalizedRankingAmount,
+    );
+    if (this.currentFight && twinNormalizedDamage > 0) {
+      this.currentFight.twinNormalizationByActor.set(
+        actor.id,
+        (this.currentFight.twinNormalizationByActor.get(actor.id) ?? 0) +
+          twinNormalizedDamage,
+      );
+    }
+    const periodicSupportKey = `${sourceGuid}:${destGuid}:${actorSpellId}`;
+    const periodicSupportSnapshot =
+      event === "SPELL_PERIODIC_DAMAGE" &&
+      this.periodicSupportSnapshots.has(periodicSupportKey)
+        ? this.periodicSupportSnapshots.get(periodicSupportKey)
+        : undefined;
+    const supportAttribution =
+      !fromPet && sourceGuid === actor.id && (damageSchool & 1) === 1
+        ? event === "SPELL_PERIODIC_DAMAGE" &&
+          this.periodicSupportSnapshots.has(periodicSupportKey)
+          ? periodicSupportSnapshot ?? undefined
+          : this.activeSupportAttribution.get(actor.id)
+        : undefined;
+    const supportContribution = supportAttribution
+      ? supportDamageContribution(payload, normalizedRankingAmount)
+      : 0;
+    const actorRankingAmount = Math.max(
+      0,
+      normalizedRankingAmount - supportContribution,
+    );
+    if (actorRankingAmount > 0) {
+      actor.spells.set(
+        actorSpellId,
+        (actor.spells.get(actorSpellId) ?? 0) + actorRankingAmount,
+      );
+    }
+    const supportActor =
+      supportAttribution && supportContribution > 0
+        ? this.ensureActor(
+            supportAttribution.sourceActorId,
+            this.actors.get(supportAttribution.sourceActorId)?.name ?? "未知玩家",
+          )
+        : undefined;
+    const supportSpellId = supportAttribution
+      ? -Math.abs(supportAttribution.spellId)
+      : 0;
+    if (supportActor && supportContribution > 0) {
+      supportActor.seenInEncounter ||= Boolean(this.currentFight);
+      supportActor.spells.set(
+        supportSpellId,
+        (supportActor.spells.get(supportSpellId) ?? 0) + supportContribution,
+      );
+    }
     if (event === "SWING_DAMAGE") this.inferActor(actor, spellName, event);
 
     if (this.currentFight) {
-      addToNestedMap(this.currentFight.actorTargets, actor.id, destName, amount);
+      if (actorRankingAmount > 0) {
+        addToNestedMap(
+          this.currentFight.actorTargets,
+          actor.id,
+          destName,
+          actorRankingAmount,
+        );
+        addToActorSpellTargets(
+          this.currentFight.actorSpellTargets,
+          actor.id,
+          actorSpellId,
+          destName,
+          actorRankingAmount,
+        );
+      }
+      if (supportActor && supportContribution > 0) {
+        addToNestedMap(
+          this.currentFight.actorTargets,
+          supportActor.id,
+          destName,
+          supportContribution,
+        );
+        addToActorSpellTargets(
+          this.currentFight.actorSpellTargets,
+          supportActor.id,
+          supportSpellId,
+          destName,
+          supportContribution,
+        );
+      }
       this.currentFight.targets.set(
         destName,
-        (this.currentFight.targets.get(destName) ?? 0) + amount,
+        (this.currentFight.targets.get(destName) ?? 0) +
+          normalizedRankingAmount,
       );
       if (destGuid) {
         this.currentFight.targetDamageByGuid.set(
           destGuid,
-          (this.currentFight.targetDamageByGuid.get(destGuid) ?? 0) + amount,
+          (this.currentFight.targetDamageByGuid.get(destGuid) ?? 0) +
+            normalizedRankingAmount,
         );
       }
       const damageEvent = this.addTimelineEvent({
@@ -1361,24 +1906,62 @@ class CombatLogParser {
         hp: payload.snapshot?.hp,
         maxHp: payload.snapshot?.maxHp,
       });
-      if (event === "SWING_DAMAGE" && damageEvent) {
-        this.queueSwingEvent(timestampMs, sourceGuid, destGuid, damageEvent);
+      if (event === "SWING_DAMAGE" && payload.advanced && damageEvent) {
+        this.queueSwingEvent(timestampMs, sourceGuid, destGuid, {
+          timestampMs,
+          event: damageEvent,
+          actorId: actor.id,
+          actorSpellId,
+          targetName: destName,
+          targetGuid: destGuid,
+          fromPet,
+          fight: this.currentFight,
+          boosted: (this.activeBoostCounts.get(actor.id) ?? 0) > 0,
+          twinBoosted: twinBoostedTarget,
+          oldRankingAmount: rankingAmount,
+          oldNormalizedAmount: normalizedRankingAmount,
+          oldTwinAdjustment: twinNormalizedDamage,
+          oldActorAmount: actorRankingAmount,
+          supportActorId: supportActor?.id,
+          supportSpellId: supportActor ? supportSpellId : undefined,
+          oldSupportAmount: supportContribution,
+        });
       }
       if (this.currentFight.puller === "待识别") {
         this.currentFight.puller = actor.name;
         this.currentFight.pullMethod = `${spellName} 首次造成有效伤害`;
       }
       if ((this.activeBoostCounts.get(actor.id) ?? 0) > 0) {
-        this.currentFight.boostedByActor.set(
+        addToNestedMap(
+          this.currentFight.boostedActorTargets,
           actor.id,
-          (this.currentFight.boostedByActor.get(actor.id) ?? 0) + amount,
+          destName,
+          normalizedRankingAmount,
         );
       }
       this.currentFight.endMs = timestampMs;
     } else {
       this.recordTrashActivity(timestampMs);
-      addToNestedMap(this.trashActorTargets, actor.id, destName, amount);
-      this.trashTargets.set(destName, (this.trashTargets.get(destName) ?? 0) + amount);
+      if (actorRankingAmount > 0) {
+        addToNestedMap(
+          this.trashActorTargets,
+          actor.id,
+          destName,
+          actorRankingAmount,
+        );
+      }
+      if (supportActor && supportContribution > 0) {
+        addToNestedMap(
+          this.trashActorTargets,
+          supportActor.id,
+          destName,
+          supportContribution,
+        );
+      }
+      this.trashTargets.set(
+        destName,
+        (this.trashTargets.get(destName) ?? 0) + normalizedRankingAmount,
+      );
     }
   }
 
@@ -1386,29 +1969,291 @@ class CombatLogParser {
     timestampMs: number,
     sourceGuid: string | undefined,
     destGuid: string | undefined,
-    event: CombatTimelineEvent,
+    pending: PendingSwingEvent,
   ) {
-    const key = `${timestampMs}:${sourceGuid || "0"}:${destGuid || "0"}`;
-    const events = this.pendingSwingEvents.get(key) ?? [];
-    events.push(event);
+    const key = `${sourceGuid || "0"}:${destGuid || "0"}`;
+    const landed = this.pendingLandedSwings.get(key) ?? [];
+    let landedIndex = -1;
+    let closestLandedDelta = Number.POSITIVE_INFINITY;
+    for (let index = 0; index < landed.length; index += 1) {
+      const delta = Math.abs(timestampMs - landed[index].timestampMs);
+      if (delta > 250 || delta >= closestLandedDelta) continue;
+      landedIndex = index;
+      closestLandedDelta = delta;
+    }
+    if (landedIndex >= 0) {
+      const [match] = landed.splice(landedIndex, 1);
+      if (!landed.length) this.pendingLandedSwings.delete(key);
+      if (match) this.applyLandedSwing(pending, match.payload);
+      return;
+    }
+
+    const previous = this.pendingSwingEvents.get(key) ?? [];
+    const events: PendingSwingEvent[] = [];
+    for (const candidate of previous) {
+      if (timestampMs - candidate.timestampMs <= 500) {
+        events.push(candidate);
+      } else {
+        this.discardPendingSwing(candidate);
+      }
+    }
+    events.push(pending);
     this.pendingSwingEvents.set(key, events);
   }
 
   private enrichSwingDamage(fields: string[], timestampMs: number) {
-    if (!this.currentFight) return;
     const sourceGuid = fields[1];
     const destGuid = fields[5];
-    const key = `${timestampMs}:${sourceGuid || "0"}:${destGuid || "0"}`;
+    const key = `${sourceGuid || "0"}:${destGuid || "0"}`;
     const events = this.pendingSwingEvents.get(key);
-    if (!events?.length) return;
-    const event = events.shift();
+    const payload = parseDamagePayload(fields, "SWING_DAMAGE");
+    if (!events?.length) {
+      const landed = (this.pendingLandedSwings.get(key) ?? []).filter(
+        (candidate) => timestampMs - candidate.timestampMs <= 500,
+      );
+      landed.push({ timestampMs, payload });
+      this.pendingLandedSwings.set(key, landed);
+      return;
+    }
+    let matchIndex = -1;
+    let closestDelta = Number.POSITIVE_INFINITY;
+    for (let index = 0; index < events.length; index += 1) {
+      const delta = timestampMs - events[index].timestampMs;
+      if (delta < -5 || delta > 250 || delta >= closestDelta) continue;
+      matchIndex = index;
+      closestDelta = delta;
+    }
+    if (matchIndex < 0) return;
+    const [pending] = events.splice(matchIndex, 1);
     if (!events.length) this.pendingSwingEvents.delete(key);
-    if (!event) return;
-    const snapshot = parseAdvancedSnapshot(fields, 9);
-    if (!snapshot) return;
-    event.snapshotUnitId = snapshot.unitId;
-    event.hp = snapshot.hp;
-    event.maxHp = snapshot.maxHp;
+    if (!pending) return;
+    this.applyLandedSwing(pending, payload);
+  }
+
+  private applyLandedSwing(
+    pending: PendingSwingEvent,
+    payload: DamagePayload,
+  ) {
+    const event = pending.event;
+    event.amount = payload.amount;
+    event.rawAmount = payload.rawAmount;
+    event.overAmount = payload.overkill;
+    event.absorbed = payload.absorbed;
+    event.blocked = payload.blocked;
+    event.resisted = payload.resisted;
+    event.critical = payload.critical;
+    event.glancing = payload.glancing;
+    event.crushing = payload.crushing;
+    event.snapshotUnitId = payload.snapshot?.unitId;
+    event.hp = payload.snapshot?.hp;
+    event.maxHp = payload.snapshot?.maxHp;
+    this.reconcileSwingContribution(pending, payload);
+  }
+
+  private discardPendingSwing(pending: PendingSwingEvent) {
+    // The time-server Eagle guardian emits a preliminary SWING_DAMAGE after
+    // it has already despawned. WCL only accepts that guardian's hit when the
+    // matching target-side SWING_DAMAGE_LANDED exists. Other units can lack
+    // the target-side mirror at encounter boundaries, so keep their source
+    // event as the fallback.
+    if (
+      !pending.actorId ||
+      !pending.event.sourceUnitId?.includes("-260758-")
+    ) {
+      return;
+    }
+    this.reconcileSwingContribution(pending, {
+      amount: 0,
+      landedAmount: 0,
+      rawAmount: 0,
+      overkill: 0,
+      resisted: 0,
+      blocked: 0,
+      absorbed: 0,
+      critical: false,
+      glancing: false,
+      crushing: false,
+      advanced: true,
+    });
+    const events = pending.fight?.timelineEvents;
+    if (!events) return;
+    const index = events.indexOf(pending.event);
+    if (index >= 0) events.splice(index, 1);
+  }
+
+  private discardUnconfirmedSwingEvents() {
+    for (const events of this.pendingSwingEvents.values()) {
+      for (const pending of events) this.discardPendingSwing(pending);
+    }
+    this.pendingSwingEvents.clear();
+  }
+
+  private reconcileSwingContribution(
+    pending: PendingSwingEvent,
+    payload: DamagePayload,
+  ) {
+    const {
+      actorId,
+      actorSpellId,
+      targetName,
+      targetGuid,
+      fight,
+    } = pending;
+    if (
+      !actorId ||
+      actorSpellId === undefined ||
+      !targetName ||
+      pending.oldRankingAmount === undefined ||
+      pending.oldNormalizedAmount === undefined ||
+      pending.oldActorAmount === undefined
+    ) {
+      return;
+    }
+
+    const actor = this.actors.get(actorId);
+    if (!actor) return;
+    const landedSupportAttribution =
+      !pending.fromPet && pending.event.sourceUnitId === actorId
+        ? this.activeSupportAttribution.get(actorId)
+        : undefined;
+    const supportActorId =
+      pending.supportActorId ?? landedSupportAttribution?.sourceActorId;
+    const supportSpellId =
+      pending.supportSpellId ??
+      (landedSupportAttribution
+        ? -Math.abs(landedSupportAttribution.spellId)
+        : undefined);
+    const rankingAmount = payload.amount + payload.absorbed;
+    const normalizedAmount = pending.twinBoosted
+      ? Math.round(rankingAmount / 2)
+      : rankingAmount;
+    const supportAmount = supportActorId
+      ? supportDamageContribution(payload, normalizedAmount)
+      : 0;
+    const actorAmount = Math.max(0, normalizedAmount - supportAmount);
+    const twinAdjustment = Math.max(0, rankingAmount - normalizedAmount);
+    const rankingDelta = rankingAmount - pending.oldRankingAmount;
+    const normalizedDelta = normalizedAmount - pending.oldNormalizedAmount;
+    const actorDelta = actorAmount - pending.oldActorAmount;
+    const supportDelta =
+      supportAmount - (pending.oldSupportAmount ?? 0);
+    const twinAdjustmentDelta =
+      twinAdjustment - (pending.oldTwinAdjustment ?? 0);
+
+    if (actorDelta) {
+      actor.spells.set(
+        actorSpellId,
+        Math.max(0, (actor.spells.get(actorSpellId) ?? 0) + actorDelta),
+      );
+    }
+    if (pending.fromPet && rankingDelta) {
+      actor.petDamage = Math.max(0, actor.petDamage + rankingDelta);
+    }
+
+    const supportActor = supportActorId
+      ? this.ensureActor(
+          supportActorId,
+          this.actors.get(supportActorId)?.name ?? "未知玩家",
+        )
+      : undefined;
+    if (supportActor && supportSpellId !== undefined && supportDelta) {
+      supportActor.spells.set(
+        supportSpellId,
+        Math.max(
+          0,
+          (supportActor.spells.get(supportSpellId) ?? 0) +
+            supportDelta,
+        ),
+      );
+    }
+
+    if (fight) {
+      if (actorDelta) {
+        addToNestedMap(fight.actorTargets, actorId, targetName, actorDelta);
+        addToActorSpellTargets(
+          fight.actorSpellTargets,
+          actorId,
+          actorSpellId,
+          targetName,
+          actorDelta,
+        );
+      }
+      if (
+        supportActorId &&
+        supportSpellId !== undefined &&
+        supportDelta
+      ) {
+        addToNestedMap(
+          fight.actorTargets,
+          supportActorId,
+          targetName,
+          supportDelta,
+        );
+        addToActorSpellTargets(
+          fight.actorSpellTargets,
+          supportActorId,
+          supportSpellId,
+          targetName,
+          supportDelta,
+        );
+      }
+      if (normalizedDelta) {
+        fight.targets.set(
+          targetName,
+          Math.max(0, (fight.targets.get(targetName) ?? 0) + normalizedDelta),
+        );
+        if (targetGuid) {
+          fight.targetDamageByGuid.set(
+            targetGuid,
+            Math.max(
+              0,
+              (fight.targetDamageByGuid.get(targetGuid) ?? 0) +
+                normalizedDelta,
+            ),
+          );
+        }
+        if (pending.boosted) {
+          addToNestedMap(
+            fight.boostedActorTargets,
+            actorId,
+            targetName,
+            normalizedDelta,
+          );
+        }
+      }
+      if (twinAdjustmentDelta) {
+        fight.twinNormalizationByActor.set(
+          actorId,
+          Math.max(
+            0,
+            (fight.twinNormalizationByActor.get(actorId) ?? 0) +
+              twinAdjustmentDelta,
+          ),
+        );
+      }
+      return;
+    }
+
+    if (actorDelta) {
+      addToNestedMap(this.trashActorTargets, actorId, targetName, actorDelta);
+    }
+    if (supportActorId && supportDelta) {
+      addToNestedMap(
+        this.trashActorTargets,
+        supportActorId,
+        targetName,
+        supportDelta,
+      );
+    }
+    if (normalizedDelta) {
+      this.trashTargets.set(
+        targetName,
+        Math.max(
+          0,
+          (this.trashTargets.get(targetName) ?? 0) + normalizedDelta,
+        ),
+      );
+    }
   }
 
   private consumeHeal(fields: string[], event: string, timestampMs: number) {
@@ -1436,11 +2281,18 @@ class CombatLogParser {
     if (isPlayerGuid(targetId) && targetId !== sourceActorId) {
       actor.externalHealingDone += payload.amount;
     }
-    const spellName = this.spellNames.get(healSpellId) ?? `技能 ${healSpellId}`;
     actor.heals.set(
-      spellName,
-      (actor.heals.get(spellName) ?? 0) + payload.amount,
+      healSpellId,
+      (actor.heals.get(healSpellId) ?? 0) + payload.amount,
     );
+    if (this.currentFight) {
+      addToActorSpellAmounts(
+        this.currentFight.actorHeals,
+        actor.id,
+        healSpellId,
+        payload.amount,
+      );
+    }
 
     this.addTimelineEvent({
       t: this.timelineOffset(timestampMs),
@@ -1529,13 +2381,27 @@ class CombatLogParser {
     }
     if (!sourceActorId && !isNpcGuid(sourceUnitId)) return;
     const castSpellId = this.registerSpell(fields[9], fields[10]);
+    const targetId = fields[5];
+    if (
+      event === "SPELL_CAST_SUCCESS" &&
+      isPlayerGuid(targetId) &&
+      sourceActorId &&
+      sourceActorId !== targetId &&
+      (castSpellId === 49016 || /邪恶狂热|Hysteria/i.test(fields[10] ?? ""))
+    ) {
+      this.activeSupportAttribution.set(targetId, {
+        sourceActorId,
+        spellId: castSpellId,
+      });
+      this.spellNames.set(-Math.abs(castSpellId), safeName(fields[10], "邪恶狂热"));
+    }
     const snapshot = parseAdvancedSnapshot(fields, 12);
     this.addTimelineEvent({
       t: this.timelineOffset(timestampMs),
       kind: event === "SPELL_CAST_START" ? "cast-start" : "cast",
       sourceActorId,
       sourceUnitId,
-      targetId: fields[5],
+      targetId,
       spellId: castSpellId,
       pet: Boolean(sourceActorId && sourceUnitId !== sourceActorId),
       snapshotUnitId: snapshot?.unitId,
@@ -1572,12 +2438,27 @@ class CombatLogParser {
 
   private consumeMiss(fields: string[], event: string, timestampMs: number) {
     const sourceUnitId = fields[1];
+    const sourceName = isPlayerGuid(sourceUnitId)
+      ? playerName(fields[2])
+      : safeName(fields[2], "未知来源");
+    const sourceFlags = fields[3];
     const targetId = fields[5];
+    const targetName = isPlayerGuid(targetId)
+      ? playerName(fields[6])
+      : safeName(fields[6], "未知目标");
+    const targetFlags = fields[7];
     let sourceActorId = this.resolveOwnerGuid(sourceUnitId);
     if (!sourceActorId && isOwnableUnitGuid(sourceUnitId)) {
-      sourceActorId = this.resolveOwnerByName(safeName(fields[2], ""));
+      sourceActorId = this.resolveOwnerByName(sourceName);
+      if (sourceActorId) this.linkOwner(sourceUnitId, sourceActorId);
     }
-    if (!sourceActorId && !isPlayerGuid(targetId)) return;
+    if (
+      !sourceActorId &&
+      !isPlayerGuid(targetId) &&
+      !(isOwnableUnitGuid(sourceUnitId) && isFriendlyUnit(sourceFlags))
+    ) {
+      return;
+    }
     const swing = event === "SWING_MISSED";
     const missSpellId = swing
       ? sourceActorId && sourceUnitId !== sourceActorId
@@ -1589,6 +2470,7 @@ class CombatLogParser {
     const mitigationAmount = numeric(fields[mitigationIndex]);
     const rawAmount =
       numeric(fields[mitigationIndex + 1]) || mitigationAmount;
+    const fullyAbsorbed = missType === "ABSORB" && mitigationAmount > 0;
     this.addTimelineEvent({
       t: this.timelineOffset(timestampMs),
       kind: "miss",
@@ -1596,6 +2478,7 @@ class CombatLogParser {
       sourceUnitId,
       targetId,
       spellId: missSpellId,
+      amount: fullyAbsorbed ? mitigationAmount : undefined,
       rawAmount: rawAmount || undefined,
       absorbed: missType === "ABSORB" ? mitigationAmount : undefined,
       blocked: missType === "BLOCK" ? mitigationAmount : undefined,
@@ -1604,6 +2487,155 @@ class CombatLogParser {
       periodic: event === "SPELL_PERIODIC_MISSED",
       pet: Boolean(sourceActorId && sourceUnitId !== sourceActorId),
     });
+
+    // Advanced logs encode a fully absorbed offensive hit as *_MISSED with
+    // ABSORB plus the attempted amount. WCL includes that event in Damage
+    // Done, so retain its attack result while also adding it to the ranking
+    // aggregates. Partial absorbs remain handled by regular damage events.
+    if (!fullyAbsorbed || !isDamageTarget(targetId, targetFlags)) return;
+
+    let actorGuid = sourceUnitId;
+    let actorName = sourceName;
+    let fromPet = false;
+    if (sourceActorId && sourceActorId !== sourceUnitId) {
+      if (this.options.mergePets !== false) {
+        actorGuid = sourceActorId;
+        actorName = this.actors.get(sourceActorId)?.name ?? "宠物主人";
+        fromPet = true;
+      }
+    } else if (
+      !sourceActorId &&
+      isOwnableUnitGuid(sourceUnitId) &&
+      isFriendlyUnit(sourceFlags)
+    ) {
+      this.unknownPetDamage += mitigationAmount;
+      const key = sourceUnitId || sourceName;
+      const source = this.unknownPetSources.get(key) ?? {
+        name: sourceName,
+        damage: 0,
+      };
+      source.damage += mitigationAmount;
+      this.unknownPetSources.set(key, source);
+    }
+    if (
+      !actorGuid ||
+      (!isPlayerGuid(actorGuid) &&
+        !(this.options.mergePets === false && isOwnableUnitGuid(actorGuid)))
+    ) {
+      return;
+    }
+
+    const actor = this.ensureActor(actorGuid, actorName);
+    actor.seenInEncounter ||= Boolean(this.currentFight);
+    if (fromPet) actor.petDamage += mitigationAmount;
+    const damageSchool = swing ? 1 : Number(fields[11]) || 0;
+    const periodicSupportKey = `${sourceUnitId}:${targetId}:${missSpellId}`;
+    const supportAttribution =
+      !fromPet && sourceUnitId === actor.id && (damageSchool & 1) === 1
+        ? event === "SPELL_PERIODIC_MISSED" &&
+          this.periodicSupportSnapshots.has(periodicSupportKey)
+          ? this.periodicSupportSnapshots.get(periodicSupportKey) ?? undefined
+          : this.activeSupportAttribution.get(actor.id)
+        : undefined;
+    const supportContribution = supportAttribution
+      ? Math.min(mitigationAmount, Math.floor(mitigationAmount / 6))
+      : 0;
+    const actorRankingAmount = mitigationAmount - supportContribution;
+    actor.spells.set(
+      missSpellId,
+      (actor.spells.get(missSpellId) ?? 0) + actorRankingAmount,
+    );
+    const supportActor =
+      supportAttribution && supportContribution > 0
+        ? this.ensureActor(
+            supportAttribution.sourceActorId,
+            this.actors.get(supportAttribution.sourceActorId)?.name ??
+              "未知玩家",
+          )
+        : undefined;
+    const supportSpellId = supportAttribution
+      ? -Math.abs(supportAttribution.spellId)
+      : 0;
+    if (supportActor && supportContribution > 0) {
+      supportActor.seenInEncounter ||= Boolean(this.currentFight);
+      supportActor.spells.set(
+        supportSpellId,
+        (supportActor.spells.get(supportSpellId) ?? 0) + supportContribution,
+      );
+    }
+    const spellName = this.spellNames.get(missSpellId) ?? `技能 ${missSpellId}`;
+    this.inferActor(actor, spellName, event);
+
+    if (this.currentFight) {
+      addToNestedMap(
+        this.currentFight.actorTargets,
+        actor.id,
+        targetName,
+        actorRankingAmount,
+      );
+      addToActorSpellTargets(
+        this.currentFight.actorSpellTargets,
+        actor.id,
+        missSpellId,
+        targetName,
+        actorRankingAmount,
+      );
+      if (supportActor && supportContribution > 0) {
+        addToNestedMap(
+          this.currentFight.actorTargets,
+          supportActor.id,
+          targetName,
+          supportContribution,
+        );
+        addToActorSpellTargets(
+          this.currentFight.actorSpellTargets,
+          supportActor.id,
+          supportSpellId,
+          targetName,
+          supportContribution,
+        );
+      }
+      this.currentFight.targets.set(
+        targetName,
+        (this.currentFight.targets.get(targetName) ?? 0) + mitigationAmount,
+      );
+      if (targetId) {
+        this.currentFight.targetDamageByGuid.set(
+          targetId,
+          (this.currentFight.targetDamageByGuid.get(targetId) ?? 0) +
+            mitigationAmount,
+        );
+      }
+      if ((this.activeBoostCounts.get(actor.id) ?? 0) > 0) {
+        addToNestedMap(
+          this.currentFight.boostedActorTargets,
+          actor.id,
+          targetName,
+          mitigationAmount,
+        );
+      }
+      this.currentFight.endMs = timestampMs;
+    } else {
+      this.recordTrashActivity(timestampMs);
+      addToNestedMap(
+        this.trashActorTargets,
+        actor.id,
+        targetName,
+        actorRankingAmount,
+      );
+      if (supportActor && supportContribution > 0) {
+        addToNestedMap(
+          this.trashActorTargets,
+          supportActor.id,
+          targetName,
+          supportContribution,
+        );
+      }
+      this.trashTargets.set(
+        targetName,
+        (this.trashTargets.get(targetName) ?? 0) + mitigationAmount,
+      );
+    }
   }
 
   private consumeInterrupt(fields: string[], timestampMs: number) {
@@ -1831,31 +2863,38 @@ class CombatLogParser {
             incomingShare >= 0.12) ||
           (actor.tankHint >= 5 && incomingShare >= 0.08) ||
           (actor.tankHint >= 15 &&
-            actor.damageTaken >= maxIncomingDamage * 0.2);
+            incomingShare >= 0.06 &&
+            actor.damageTaken >= maxIncomingDamage * 0.45);
         const isHealer =
           !isTank &&
           actor.externalHealingDone >= 250_000 &&
           actor.externalHealingDone >= totalExternalHealing * 0.03;
-        let role: CombatRole = "unknown";
-        if (isTank) role = "tank";
-        else if (isHealer) role = "healer";
-        else if (actor.rangedHint > actor.meleeHint) role = "ranged";
-        else if (actor.meleeHint > 0) role = "melee";
+        let combatRole: CombatRole = "unknown";
+        if (isTank) combatRole = "tank";
+        else if (isHealer) combatRole = "healer";
+        else if (actor.rangedHint > actor.meleeHint) combatRole = "ranged";
+        else if (actor.meleeHint > 0) combatRole = "melee";
         else if (
           ["猎人", "法师", "牧师", "萨满祭司", "术士"].includes(actor.className)
         ) {
-          role = "ranged";
+          combatRole = "ranged";
         } else if (
           ["死亡骑士", "圣骑士", "潜行者", "战士"].includes(actor.className)
         ) {
-          role = "melee";
+          combatRole = "melee";
         }
+        const talentPoints = selectedTalentPoints(actor);
+        const talent = talentIdentity(actor.className, talentPoints, isTank);
+        const role = talent.role ?? combatRole;
 
         return {
           id: actor.id,
           name: actor.name,
           className: actor.className,
           role,
+          specialization: talent.specialization,
+          talentPoints,
+          roleSource: talent.roleSource ?? "combat",
           damageTaken: actor.damageTaken,
           petDamage: actor.petDamage,
           healingDone: actor.healingDone,
@@ -1863,12 +2902,18 @@ class CombatLogParser {
           absorbDone: actor.absorbDone,
           topSpells: [...actor.spells.entries()]
             .sort((a, b) => b[1] - a[1])
-            .slice(0, 5)
-            .map(([name, damage]) => ({ name, damage })),
+            .map(([abilityId, damage]) => ({
+              spellId: abilityId,
+              name: this.spellNames.get(abilityId) ?? `技能 ${abilityId}`,
+              damage,
+            })),
           topHeals: [...actor.heals.entries()]
             .sort((a, b) => b[1] - a[1])
-            .slice(0, 5)
-            .map(([name, healing]) => ({ name, healing })),
+            .map(([abilityId, healing]) => ({
+              spellId: abilityId,
+              name: this.spellNames.get(abilityId) ?? `技能 ${abilityId}`,
+              healing,
+            })),
         };
       });
 
@@ -1913,8 +2958,21 @@ class CombatLogParser {
           name: this.unitNames.get(id) ?? "未知目标",
           damage,
         }));
+      const exclusionRules = WCL_TARGET_EXCLUSIONS[fight.encounterId] ?? {};
+      const excludedTargets = new Set(
+        Object.keys(exclusionRules).filter(
+          (target) => (fight.targets.get(target) ?? 0) > 0,
+        ),
+      );
+      const rawActorTargets = nestedMapToRecord(fight.actorTargets);
+      const rawTargets = mapToRecord(fight.targets);
+      const filteredBoostedTargets = filterNestedTargets(
+        fight.boostedActorTargets,
+        excludedTargets,
+      );
       return {
         id: fight.id,
+        encounterId: fight.encounterId,
         name: fight.name,
         startMs: effectiveStartMs,
         endMs: fight.endMs,
@@ -1923,9 +2981,48 @@ class CombatLogParser {
         success: fight.success,
         puller: fight.puller,
         pullMethod: fight.pullMethod,
-        actorTargets: nestedMapToRecord(fight.actorTargets),
-        targets: mapToRecord(fight.targets),
-        boostedByActor: mapToRecord(fight.boostedByActor),
+        actorTargets: filterNestedTargets(fight.actorTargets, excludedTargets),
+        targets: filterTargets(fight.targets, excludedTargets),
+        rawActorTargets,
+        rawTargets,
+        automaticExclusions: [...excludedTargets].map((target) => ({
+          target,
+          damage: fight.targets.get(target) ?? 0,
+          reason: exclusionRules[target],
+        })),
+        automaticAdjustments: [
+          ...[...fight.normalizationByActor.entries()].map(
+            ([actorId, damage]) => ({
+              key: `void-power-${actorId}`,
+              label: "虚空之能收益正常化",
+              damage,
+              actorId,
+              reason:
+                "WCL P4.5+ 加拉克苏斯规则：按被偷取的虚空之能层数还原基础伤害",
+            }),
+          ),
+          ...[...fight.twinNormalizationByActor.entries()].map(
+            ([actorId, damage]) => ({
+              key: `twin-empowerment-${actorId}`,
+              label: "双子增效伤害正常化",
+              damage,
+              actorId,
+              reason:
+                "WCL 瓦格里双子规则：黑暗增效或光明增效期间的双倍伤害还原为基础伤害",
+            }),
+          ),
+        ],
+        actorSpellTargets: actorSpellTargetsToRecord(
+          fight.actorSpellTargets,
+          excludedTargets,
+        ),
+        actorHeals: actorSpellAmountsToRecord(fight.actorHeals),
+        boostedByActor: Object.fromEntries(
+          Object.entries(filteredBoostedTargets).map(([actorId, targets]) => [
+            actorId,
+            Object.values(targets).reduce((sum, damage) => sum + damage, 0),
+          ]),
+        ),
         auraMs: {
           armor: Math.min(durationMs, fight.auraMs.armor),
           faerie: Math.min(durationMs, fight.auraMs.faerie),
@@ -1966,7 +3063,7 @@ class CombatLogParser {
       warnings.push(`${unknownClassCount} 名成员缺少足够的职业技能事件，职业暂标为未知。`);
     }
     warnings.push(
-      "职业、角色与关键光环采用通用启发式识别；Boss 专属 WCL 规则仍需人工校准。",
+      "角色优先按 COMBATANT_INFO 天赋判定；已校准祖尔格拉布目标、十字军试炼增伤及高级日志落地事件，未覆盖的特殊 Boss 规则仍可能与 WCL 有差异。",
     );
 
     const windowStart =
@@ -1981,7 +3078,7 @@ class CombatLogParser {
       (fights[0]?.name ? "时光服团队日志" : "战斗日志");
     return {
       version: 1,
-      parserVersion: "0.6.0",
+      parserVersion: "0.7.0",
       logVersion: this.logVersion || undefined,
       advancedLogging: this.advancedLogging,
       zones: [...this.encounterZones],
@@ -2909,7 +4006,7 @@ export function createDemoReport(): CombatReport {
 
   return {
     version: 1,
-    parserVersion: "0.6.0",
+    parserVersion: "0.7.0",
     logVersion: 9,
     advancedLogging: true,
     zones: ["纳克萨玛斯"],

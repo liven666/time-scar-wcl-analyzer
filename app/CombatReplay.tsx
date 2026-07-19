@@ -196,7 +196,6 @@ const GCD_MS = 1_500;
 const DEFAULT_GCD_CELL_WIDTH = 76;
 const MIN_GCD_CELL_WIDTH = 40;
 const MAX_GCD_CELL_WIDTH = 148;
-const OPERATION_LABEL_WIDTH = 176;
 
 const MISS_TYPE_LABELS: Record<string, string> = {
   MISS: "未命中",
@@ -1349,7 +1348,7 @@ function CombatReplay({
 
   const operationCells = useMemo<OperationCell[]>(() => {
     const cellCount = Math.max(1, Math.ceil(durationMs / GCD_MS));
-    const cells = Array.from({ length: cellCount }, (_, index) => {
+    const cells: OperationCell[] = Array.from({ length: cellCount }, (_, index) => {
       const start = index * GCD_MS;
       const end = Math.min(durationMs, start + GCD_MS);
       return {
@@ -2172,7 +2171,9 @@ function CombatReplay({
     const bounds = element.getBoundingClientRect();
     const viewportWidth = document.documentElement.clientWidth;
     const viewportHeight = document.documentElement.clientHeight;
-    const width = Math.max(280, Math.min(390, viewportWidth - 24));
+    const preferredWidth =
+      viewportWidth >= 2560 ? 520 : viewportWidth >= 1680 ? 460 : 390;
+    const width = Math.max(280, Math.min(preferredWidth, viewportWidth - 24));
     const centeredLeft = bounds.left + bounds.width / 2 - width / 2;
     const left = Math.max(
       12,
@@ -2649,7 +2650,7 @@ function CombatReplay({
               <div
                 className="operation-axis-canvas"
                 style={{
-                  width: `${operationWidth + OPERATION_LABEL_WIDTH}px`,
+                  width: `calc(${operationWidth}px + var(--operation-label-width))`,
                 }}
               >
                 <div className="operation-ruler-row">
@@ -3295,7 +3296,9 @@ function CombatReplay({
           >
             <div
               className="replay-canvas"
-              style={{ width: `${timelineWidth + 196}px` }}
+              style={{
+                width: `calc(${timelineWidth}px + var(--replay-label-width))`,
+              }}
             >
               <div
                 className={`replay-axis-row ${laneDetail?.kind === "moment" ? "is-selected" : ""}`}

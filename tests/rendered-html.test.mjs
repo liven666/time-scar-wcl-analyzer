@@ -37,8 +37,13 @@ test("server-renders the WCL analyzer shell", async () => {
   assert.match(html, /非真实数据/);
   assert.doesNotMatch(html, /class="report-section"/);
   assert.doesNotMatch(html, /战斗复盘时间轴|逐事件明细|玩家操作轴/);
-  assert.match(html, /时光服阶段副本表/);
-  assert.match(html, /纳克萨玛斯属于 <strong>P3<\/strong>/);
+  assert.match(html, /当前赛季进度/);
+  assert.match(html, /当前进行中/);
+  assert.match(html, /第 8 周/);
+  assert.match(html, /预计还将持续/);
+  assert.match(html, /7 月 23 日—7 月 30 日/);
+  assert.match(html, /官方尚未公布 P5 日期/);
+  assert.doesNotMatch(html, /时光服阶段副本表|纳克萨玛斯属于|已修正/);
   assert.match(html, /能处理真实日志，但不冒充完整 WCL/);
   assert.match(html, /href="https:\/\/github\.com\/liven666\/time-scar-wcl-analyzer"/);
   assert.match(html, /GitHub 源码/);
