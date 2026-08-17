@@ -14,6 +14,7 @@ import {
   parseCombatLogFileInWorker,
   type CombatLogWorkerResponse,
 } from "./lib/combat-log-client";
+import { getPhaseProgress } from "./lib/phase-progress";
 import CombatReplay from "./CombatReplay";
 import PlayerComparison from "./PlayerComparison";
 import {
@@ -199,16 +200,16 @@ const TITAN_PHASE_STATUS = {
   phase: "P5",
   season: "晨星破晓",
   raids: "祖阿曼 · 太阳之井高地",
-  startedAt: "2026.08.06",
+  startedAt: "2026-08-06",
+  startedDisplay: "2026.08.06",
   startedLabel: "8.06 开始",
-  currentWeek: 2,
-  estimatedRemaining: "约 6—8 周",
   nextPhase: "P6",
   nextWindow: "10 月上旬—中旬",
-  nextWindowDateTime: "2026-10-01",
+  forecastStartAt: "2026-10-01",
+  forecastEndAt: "2026-10-15",
   forecastWeekRange: "第 9 至第 10 周",
   timelineWeeks: 10,
-  updatedAt: "2026.08.17",
+  verifiedAt: "2026.08.17",
   historicalCadence: "约 8—10 周",
   officialNotice: "https://wow.blizzard.cn/news/trr/20260724/43039_1308957.html",
 } as const;
@@ -369,7 +370,7 @@ async function copyText(value: string): Promise<void> {
   }
 }
 
-export default function WclAnalyzer() {
+export default function WclAnalyzer({ initialNow }: { initialNow: number }) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const liveWorkerRef = useRef<Worker | null>(null);
   const liveSourceRef = useRef<LiveLogSource | null>(null);
@@ -410,6 +411,34 @@ export default function WclAnalyzer() {
   const [liveStatus, setLiveStatus] = useState<LiveLogStatus>("idle");
   const [liveLastUpdate, setLiveLastUpdate] = useState<Date | null>(null);
   const [liveFileName, setLiveFileName] = useState("");
+  const [phaseClock, setPhaseClock] = useState(initialNow);
+
+  const phaseProgress = useMemo(
+    () =>
+      getPhaseProgress(
+        {
+          startedAt: TITAN_PHASE_STATUS.startedAt,
+          forecastStartAt: TITAN_PHASE_STATUS.forecastStartAt,
+          forecastEndAt: TITAN_PHASE_STATUS.forecastEndAt,
+          timelineWeeks: TITAN_PHASE_STATUS.timelineWeeks,
+        },
+        new Date(phaseClock),
+      ),
+    [phaseClock],
+  );
+
+  useEffect(() => {
+    const now = Date.now();
+    const shanghaiOffset = 8 * 60 * 60 * 1000;
+    const dayMs = 24 * 60 * 60 * 1000;
+    const untilNextShanghaiMidnight =
+      dayMs - ((now + shanghaiOffset) % dayMs) + 1_000;
+    const timer = window.setTimeout(
+      () => setPhaseClock(Date.now()),
+      untilNextShanghaiMidnight,
+    );
+    return () => window.clearTimeout(timer);
+  }, [phaseClock]);
 
   const activateReport = (nextReport: CombatReport, kind: ReportKind) => {
     setReport(nextReport);
@@ -2066,8 +2095,8 @@ export default function WclAnalyzer() {
               <h2>当前赛季进度</h2>
             </div>
             <p>
-              只展示正在进行的阶段与下一阶段时间预估。资料更新于
-              {` ${TITAN_PHASE_STATUS.updatedAt}`}，正式排期以官方公告为准。
+              只展示正在进行的阶段与下一阶段时间预估。阶段资料核对至
+              {` ${TITAN_PHASE_STATUS.verifiedAt}`}，周数按北京时间自动计算。
             </p>
           </div>
           <div className="phase-dashboard">
@@ -2086,21 +2115,26 @@ export default function WclAnalyzer() {
               <div className="phase-week-heading">
                 <div>
                   <small>阶段进度</small>
-                  <strong>第 {TITAN_PHASE_STATUS.currentWeek} 周</strong>
+                  <strong>第 {phaseProgress.currentWeek} 周</strong>
                 </div>
-                <p>{TITAN_PHASE_STATUS.startedAt} 开始</p>
+                <p>{TITAN_PHASE_STATUS.startedDisplay} 开始</p>
               </div>
               <div
                 className="phase-week-track"
                 role="img"
-                aria-label={`当前为 ${TITAN_PHASE_STATUS.phase} 第 ${TITAN_PHASE_STATUS.currentWeek} 周；${TITAN_PHASE_STATUS.nextPhase} 预计在${TITAN_PHASE_STATUS.forecastWeekRange}之间开启`}
+                aria-label={`当前为 ${TITAN_PHASE_STATUS.phase} 第 ${phaseProgress.currentWeek} 周；${TITAN_PHASE_STATUS.nextPhase} 预计在${TITAN_PHASE_STATUS.forecastWeekRange}之间开启`}
+                style={
+                  {
+                    "--phase-week-count": phaseProgress.timelineWeeks,
+                  } as CSSProperties
+                }
               >
-                {Array.from({ length: TITAN_PHASE_STATUS.timelineWeeks }, (_, index) => {
+                {Array.from({ length: phaseProgress.timelineWeeks }, (_, index) => {
                   const week = index + 1;
                   const state =
-                    week < TITAN_PHASE_STATUS.currentWeek
+                    week < phaseProgress.currentWeek
                       ? "is-complete"
-                      : week === TITAN_PHASE_STATUS.currentWeek
+                      : week === phaseProgress.currentWeek
                         ? "is-current"
                         : "is-forecast";
                   return (
@@ -2113,7 +2147,7 @@ export default function WclAnalyzer() {
               </div>
               <div className="phase-week-legend" aria-hidden="true">
                 <span>{TITAN_PHASE_STATUS.startedLabel}</span>
-                <span>当前 · 第 {TITAN_PHASE_STATUS.currentWeek} 周</span>
+                <span>当前 · 第 {phaseProgress.currentWeek} 周</span>
                 <span>预估窗口</span>
               </div>
             </article>
@@ -2121,15 +2155,19 @@ export default function WclAnalyzer() {
             <aside className="phase-forecast-card" aria-label="下一阶段预估">
               <span className="phase-forecast-kicker">PHASE FORECAST</span>
               <div className="phase-forecast-stat">
-                <small>预计还将持续</small>
-                <strong>{TITAN_PHASE_STATUS.estimatedRemaining}</strong>
+                <small>
+                  {phaseProgress.forecastStatus === "before"
+                    ? "预计还将持续"
+                    : "P6 时间预估"}
+                </small>
+                <strong>{phaseProgress.estimatedRemaining}</strong>
               </div>
               <div className="phase-next-row">
                 <div>
                   <small>下一阶段</small>
                   <strong>{TITAN_PHASE_STATUS.nextPhase}</strong>
                 </div>
-                <time dateTime={TITAN_PHASE_STATUS.nextWindowDateTime}>
+                <time dateTime={TITAN_PHASE_STATUS.forecastStartAt}>
                   预计 {TITAN_PHASE_STATUS.nextWindow}
                 </time>
               </div>

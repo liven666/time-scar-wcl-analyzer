@@ -42,9 +42,11 @@ test("server-renders the WCL analyzer shell", async () => {
   assert.match(html, /P5/);
   assert.match(html, /晨星破晓/);
   assert.match(html, /祖阿曼 · 太阳之井高地/);
-  assert.match(html, /第 2 周/);
+  assert.match(html, /当前为 P5 第 \d+ 周/);
   assert.match(html, /2026\.08\.06(?:<!-- -->)? 开始/);
-  assert.match(html, /预计还将持续/);
+  assert.match(html, /周数按北京时间自动计算/);
+  assert.match(html, /预计还将持续|P6 时间预估/);
+  assert.match(html, /约 \d+(?:—\d+)? 周|已进入预估窗口|等待官方公告/);
   assert.match(html, /10 月上旬—中旬/);
   assert.match(html, /官方尚未公布 P6 日期/);
   assert.match(html, /查看 P5 官方公告/);

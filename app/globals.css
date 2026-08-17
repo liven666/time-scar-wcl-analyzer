@@ -5426,7 +5426,7 @@ select:focus-visible {
 
 .phase-week-track {
   display: grid;
-  grid-template-columns: repeat(10, minmax(0, 1fr));
+  grid-template-columns: repeat(var(--phase-week-count, 10), minmax(0, 1fr));
   gap: 6px;
   margin-top: 15px;
 }
