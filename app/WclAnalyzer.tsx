@@ -196,17 +196,21 @@ const AURA_LABELS: Record<
 };
 
 const TITAN_PHASE_STATUS = {
-  phase: "P4",
-  season: "荆棘之路",
-  raids: "十字军的试炼 · 祖尔格拉布",
-  startedAt: "2026.05.28",
-  currentWeek: 8,
-  estimatedRemaining: "不足 2 周",
-  nextPhase: "P5",
-  nextWindow: "7 月 23 日—7 月 30 日",
-  updatedAt: "2026.07.19",
-  historicalCadence: "8 / 9 / 8 周",
-  officialNotice: "https://wow.blizzard.cn/news/trr/20260528/43039_1302020.html",
+  phase: "P5",
+  season: "晨星破晓",
+  raids: "祖阿曼 · 太阳之井高地",
+  startedAt: "2026.08.06",
+  startedLabel: "8.06 开始",
+  currentWeek: 2,
+  estimatedRemaining: "约 6—8 周",
+  nextPhase: "P6",
+  nextWindow: "10 月上旬—中旬",
+  nextWindowDateTime: "2026-10-01",
+  forecastWeekRange: "第 9 至第 10 周",
+  timelineWeeks: 10,
+  updatedAt: "2026.08.17",
+  historicalCadence: "约 8—10 周",
+  officialNotice: "https://wow.blizzard.cn/news/trr/20260724/43039_1308957.html",
 } as const;
 
 const numberFormatter = new Intl.NumberFormat("zh-CN");
@@ -2089,9 +2093,9 @@ export default function WclAnalyzer() {
               <div
                 className="phase-week-track"
                 role="img"
-                aria-label={`当前为 ${TITAN_PHASE_STATUS.phase} 第 ${TITAN_PHASE_STATUS.currentWeek} 周；下一阶段预计在第 8 至第 9 周之间开启`}
+                aria-label={`当前为 ${TITAN_PHASE_STATUS.phase} 第 ${TITAN_PHASE_STATUS.currentWeek} 周；${TITAN_PHASE_STATUS.nextPhase} 预计在${TITAN_PHASE_STATUS.forecastWeekRange}之间开启`}
               >
-                {Array.from({ length: 9 }, (_, index) => {
+                {Array.from({ length: TITAN_PHASE_STATUS.timelineWeeks }, (_, index) => {
                   const week = index + 1;
                   const state =
                     week < TITAN_PHASE_STATUS.currentWeek
@@ -2108,7 +2112,7 @@ export default function WclAnalyzer() {
                 })}
               </div>
               <div className="phase-week-legend" aria-hidden="true">
-                <span>5.28 开始</span>
+                <span>{TITAN_PHASE_STATUS.startedLabel}</span>
                 <span>当前 · 第 {TITAN_PHASE_STATUS.currentWeek} 周</span>
                 <span>预估窗口</span>
               </div>
@@ -2125,19 +2129,21 @@ export default function WclAnalyzer() {
                   <small>下一阶段</small>
                   <strong>{TITAN_PHASE_STATUS.nextPhase}</strong>
                 </div>
-                <time dateTime="2026-07-23">预计 {TITAN_PHASE_STATUS.nextWindow}</time>
+                <time dateTime={TITAN_PHASE_STATUS.nextWindowDateTime}>
+                  预计 {TITAN_PHASE_STATUS.nextWindow}
+                </time>
               </div>
               <p>
-                官方尚未公布 P5 日期。预估参考前三次阶段更替的
+                P5 已于 8 月 6 日正式开放。官方尚未公布 P6 日期；上述窗口参考近期阶段
                 {` ${TITAN_PHASE_STATUS.historicalCadence} `}
-                节奏，不作为官宣。
+                的更替节奏，仅作预估。
               </p>
               <a
                 href={TITAN_PHASE_STATUS.officialNotice}
                 target="_blank"
                 rel="noreferrer"
               >
-                查看 P4 官方公告
+                查看 P5 官方公告
                 <span aria-hidden="true">↗</span>
               </a>
             </aside>
