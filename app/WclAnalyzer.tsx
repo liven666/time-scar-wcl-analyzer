@@ -197,21 +197,22 @@ const AURA_LABELS: Record<
 };
 
 const TITAN_PHASE_STATUS = {
-  phase: "P5",
-  season: "晨星破晓",
-  raids: "祖阿曼 · 太阳之井高地",
-  startedAt: "2026-08-06",
-  startedDisplay: "2026.08.06",
-  startedLabel: "8.06 开始",
-  nextPhase: "P6",
-  nextWindow: "10 月上旬—中旬",
-  forecastStartAt: "2026-10-01",
-  forecastEndAt: "2026-10-15",
-  forecastWeekRange: "第 9 至第 10 周",
-  timelineWeeks: 10,
-  verifiedAt: "2026.08.17",
-  historicalCadence: "约 8—10 周",
-  officialNotice: "https://wow.blizzard.cn/news/trr/20260724/43039_1308957.html",
+  phase: "P6",
+  season: "群星之巅",
+  raids: "奥杜尔",
+  startedAt: "2026-10-08",
+  startedDisplay: "2026.10.08",
+  startedLabel: "10.08 开始",
+  nextPhase: "P7",
+  nextRaids: "卡拉赞（25人）· 格鲁尔的巢穴 · 玛瑟里顿的巢穴",
+  nextWindow: "12 月上旬—中旬",
+  forecastStartAt: "2026-12-03",
+  forecastEndAt: "2026-12-17",
+  forecastWeekRange: "第 9 至第 11 周",
+  timelineWeeks: 11,
+  verifiedAt: "2026.11.03",
+  historicalCadence: "约 9—10 周",
+  officialNotice: "https://wow.blizzard.cn/news/20260924/43790_1315082.html",
 } as const;
 
 const numberFormatter = new Intl.NumberFormat("zh-CN");
@@ -2158,7 +2159,7 @@ export default function WclAnalyzer({ initialNow }: { initialNow: number }) {
                 <small>
                   {phaseProgress.forecastStatus === "before"
                     ? "预计还将持续"
-                    : "P6 时间预估"}
+                    : `${TITAN_PHASE_STATUS.nextPhase} 时间预估`}
                 </small>
                 <strong>{phaseProgress.estimatedRemaining}</strong>
               </div>
@@ -2172,7 +2173,8 @@ export default function WclAnalyzer({ initialNow }: { initialNow: number }) {
                 </time>
               </div>
               <p>
-                P5 已于 8 月 6 日正式开放。官方尚未公布 P6 日期；上述窗口参考近期阶段
+                P6 已于 10 月 8 日正式开放。官方确认 P7 将于 2026 年冬季开放，副本为
+                {` ${TITAN_PHASE_STATUS.nextRaids}`}，但尚未公布精确日期；上述窗口参考近期阶段
                 {` ${TITAN_PHASE_STATUS.historicalCadence} `}
                 的更替节奏，仅作预估。
               </p>
@@ -2181,7 +2183,7 @@ export default function WclAnalyzer({ initialNow }: { initialNow: number }) {
                 target="_blank"
                 rel="noreferrer"
               >
-                查看 P5 官方公告
+                查看 P6 官方公告
                 <span aria-hidden="true">↗</span>
               </a>
             </aside>
