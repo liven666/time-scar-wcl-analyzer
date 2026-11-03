@@ -13,7 +13,7 @@ export async function generateMetadata(): Promise<Metadata> {
     (host.includes("localhost") ? "http" : "https");
   const origin = `${protocol}://${host}`;
   const description =
-    "在浏览器本地解析 WoWCombatLog.txt，生成伤害排行、Boss 口径、合格线、关键减益覆盖和开怪记录。";
+    "在浏览器本地解析 WoWCombatLog.txt，按 Boss 与角色还原逐次施法、伤害、治疗、血量和 Buff 时间轴。";
 
   return {
     title: "时光战痕｜魔兽世界时光服 WCL 日志分析",
@@ -21,15 +21,24 @@ export async function generateMetadata(): Promise<Metadata> {
     keywords: ["魔兽世界", "时光服", "WCL", "战斗日志", "DPS分析"],
     openGraph: {
       title: "时光战痕｜时光服 WCL 分析台",
-      description: "原始日志不上传，打完即看，按团规切换统计口径。",
+      description: "战斗结束，复盘才刚开始。原始日志不上传，逐次施法可追溯。",
       type: "website",
       locale: "zh_CN",
       url: origin,
+      images: [
+        {
+          url: `${origin}/og-v2.png`,
+          width: 1200,
+          height: 630,
+          alt: "时光战痕——战斗结束，复盘才刚开始。",
+        },
+      ],
     },
     twitter: {
-      card: "summary",
+      card: "summary_large_image",
       title: "时光战痕｜时光服 WCL 分析台",
-      description: "原始日志不上传，打完即看，按团规切换统计口径。",
+      description: "战斗结束，复盘才刚开始。原始日志不上传，逐次施法可追溯。",
+      images: [`${origin}/og-v2.png`],
     },
   };
 }

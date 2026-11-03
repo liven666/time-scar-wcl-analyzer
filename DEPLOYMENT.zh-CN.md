@@ -5,7 +5,7 @@
 - Node.js `>= 22.13.0`
 - pnpm `11.9.0`（可通过 Corepack 自动启用）
 - 构建机器至少预留 1 GB 内存
-- 不需要数据库、对象存储或环境密钥
+- 不需要数据库或对象存储；若启用公开 WCL 角色对比，需要两项服务端环境密钥
 
 安装并验证：
 
@@ -14,6 +14,21 @@ corepack enable
 pnpm install --frozen-lockfile
 pnpm test
 ```
+
+## WCL 角色对比授权
+
+在 [Warcraft Logs API Clients](https://www.warcraftlogs.com/api/clients) 创建 OAuth
+Client，并在部署平台设置：
+
+```dotenv
+WCL_CLIENT_ID=你的客户端ID
+WCL_CLIENT_SECRET=你的客户端密钥
+```
+
+服务端使用 Client Credentials 流程读取公开报告。不要把 `WCL_CLIENT_SECRET` 放入
+以 `NEXT_PUBLIC_`、`VITE_` 等前缀开头的变量，也不要提交 `.env.local`。未配置时，
+本地日志解析和复盘功能不受影响，页面会明确提示“WCL 对比服务尚未配置”。私密或未公开
+报告不在当前功能范围内。
 
 ## 推荐：通用 Node.js 平台
 
@@ -58,8 +73,8 @@ pnpm exec wrangler deploy --config dist/server/wrangler.json
   服务或 Cloudflare Workers；若要切换适配器，需要重新验证 Web Worker、API 路由和
   大文件解析。
 - 服务端需要允许访问 `https://nether.wowhead.com`、`https://wow.zamimg.com` 和
-  `https://warcraft.wiki.gg` 才能补全未内置的技能图标。访问失败时页面仍会显示文字
-  备用图标，不影响日志解析。
+  `https://warcraft.wiki.gg` 才能补全未内置的技能图标；启用角色对比时还需允许访问
+  `https://www.warcraftlogs.com`。访问失败时页面仍会显示文字备用图标，不影响日志解析。
 
 ## 日志与实时解析边界
 
